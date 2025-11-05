@@ -1,0 +1,64 @@
+name: Compile & Release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release Version'
+        required: true
+        type: string
+      release_notes:
+        description: 'Summary description prepended to changelog'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.13.3'
+
+      - name: Install dependencies
+        run: >
+          python -m pip install --upgrade pip
+
+          pip install pyinstaller
+          
+          pip install -r requirements.txt
+
+      - name: Package Application with PyInstaller
+        run: |
+          pyinstaller guildChatClient.spec
+
+      - name: Create a changelog since the last release tag
+        id: changelog
+        shell: bash
+        run: |
+          CHANGELOG="${{ github.workspace }}-changelog.txt"
+          LAST_TAG=$(git describe --tags $(git rev-list --tags --max-count=1))
+          echo "# Release notes" > $CHANGELOG
+          echo ${{ github.event.inputs.release_notes }} >> $CHANGELOG
+          echo ""
+          echo "# Changes since $LAST_TAG" >> $CHANGELOG
+          git log --pretty=format:"- %s" $LAST_TAG..HEAD >> $CHANGELOG
+          echo filename=$CHANGELOG >> $GITHUB_OUTPUT
+
+      - name: Create the github release tag and upload artifacts
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: dist/guildChatClient.exe
+          artifactErrorsFailBuild: true
+          bodyFile:  "${{ steps.changelog.outputs.filename }}"
+          commit: ${{ github.sha }}
+          generateReleaseNotes: true
+          tag: ${{ github.event.inputs.version }}
