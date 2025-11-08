@@ -411,7 +411,7 @@ class EQClientGUI:
                     break
                 if pipe_hr == 0 and pipe_data:
                     self.pipe_queue.put(pipe_data)
-            time.sleep(0.1)
+            time.sleep(0)
 
     def new_char_msgbox(self):
         msg_box = tk.Toplevel(self.root)
@@ -490,7 +490,17 @@ class EQClientGUI:
                 return False
 
             # Guild messages only
-            if json_data['data']['type'] not in [259, 310]:
+            if json_data['data']['type'] not in [
+                15,   # Yellow Text "Channel", inc Quake
+                259,  # Guild
+                310   # Guild Echo
+            ]:
+                return False
+
+            # Filter for yellow text "Channel"
+            if (json_data['data']['type'] == 15
+                and not json_data['data']['text'].startswith("The next earthquake")
+            ):
                 return False
 
             return json_data['data']['text']
@@ -505,13 +515,15 @@ class EQClientGUI:
 
     def process_message(self, pipe_message):
         """Looks for relevant data, modifies as nessacary"""
-        guild_match = re.match(GUILD_PATTERN, pipe_message)
-        if guild_match:
-            full_message = guild_match.group(0)
-            if full_message == '':  # Skip empty messages
-                return False
-            full_message = re.sub(r'^\b(You)\b', self.client_character_name, full_message)
-            return (full_message)
+        # guild_match = re.match(GUILD_PATTERN, pipe_message)
+        # if guild_match:
+        #     full_message = guild_match.group(0)
+        #     if full_message == '':  # Skip empty messages
+        #         return False
+        #     full_message = re.sub(r'^\b(You)\b', self.client_character_name, full_message)
+        #     return (full_message)
+        edited_message = re.sub(r'^\b(You)\b', self.client_character_name, pipe_message)
+        return edited_message
         return False
 
     def pipe_message_loop(self):
@@ -530,14 +542,14 @@ class EQClientGUI:
                 time.sleep(1)
                 continue
             if self.pipe_queue.empty():
-                time.sleep(0.01)
+                time.sleep(0.05)
                 continue
             try:
                 new_message = self.pipe_queue.get(block=False)
                 extracted_message = self.extract_pipe_message(new_message)
 
                 if not extracted_message:
-                    time.sleep(0.01)
+                    time.sleep(0)
                     continue
 
                 message = self.process_message(extracted_message)
@@ -647,7 +659,7 @@ class EQClientGUI:
 
                 try:
                     await ws.send(json.dumps(payload))
-                    self.log(f"📤 Sent guild message: {message}")
+                    self.log(f"📤 Forwarded message: {message}")
                 except websockets.ConnectionClosed:
                     self.log("⚠️ WebSocket connection closed during send — stopping sender.")
                     if self.guild_message_queue.empty():  # Retry if queue is still empty
