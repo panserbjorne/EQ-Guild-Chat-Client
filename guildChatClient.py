@@ -489,7 +489,7 @@ class EQClientGUI:
                 self.last_tick = time.time()
                 return False
 
-            # Guild messages only
+            # Specified Channels only
             if json_data['data']['type'] not in [
                 15,   # Yellow Text "Channel", inc Quake
                 259,  # Guild
@@ -499,7 +499,8 @@ class EQClientGUI:
 
             # Filter for yellow text "Channel"
             if (json_data['data']['type'] == 15
-                and not json_data['data']['text'].startswith("The next earthquake")
+                    and not json_data['data']['text'].startswith("The next earthquake")
+                    and not json_data['data']['text'].startswith("PVP Druzzil Ro BROADCASTS")
             ):
                 return False
 
