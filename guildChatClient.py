@@ -516,16 +516,12 @@ class EQClientGUI:
 
     def process_message(self, pipe_message):
         """Looks for relevant data, modifies as nessacary"""
-        # guild_match = re.match(GUILD_PATTERN, pipe_message)
-        # if guild_match:
-        #     full_message = guild_match.group(0)
-        #     if full_message == '':  # Skip empty messages
-        #         return False
-        #     full_message = re.sub(r'^\b(You)\b', self.client_character_name, full_message)
-        #     return (full_message)
-        edited_message = re.sub(r'^\b(You)\b', self.client_character_name, pipe_message)
-        return edited_message
-        return False
+
+        # Format "You say to your guild" as "{Name} tells the guild" so duplicates can be matched
+        if pipe_message.startswith('You say to your guild'):
+            pipe_message = pipe_message.replace('You say to your guild', f'{self.client_character_name} tells the guild', 1)
+
+        return pipe_message
 
     def pipe_message_loop(self):
         """Retrieves messages from queue"""
