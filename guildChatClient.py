@@ -17,7 +17,7 @@ import win32file
 import yaml
 
 
-VERSION = '0.1.1'
+VERSION = '0.2.0'
 CONFIG_FILE = "config.yaml"
 
 DEFAULT_CONFIG = {
@@ -28,9 +28,17 @@ DEFAULT_CONFIG = {
     "start_minimized": False,
 }
 
-GUILD_PATTERN = re.compile(
+RE_GUILD_PATTERN = re.compile(
     r"^(?P<character>\w+) (?:tells the|say to your) guild, '(?P<message>.*)'$"
 )
+RE_PLAYER_NAME_PATTERN = re.compile(r"^\b(\w+)\b")
+
+CHANNEL_MAP = {
+    15:  'yellow_text',
+    259: 'guild',  # Guild Receive
+    281: 'who',
+    310: 'guild'  # Guild Echo
+}
 
 PIPE_BASE_LOCATION = '\\\\.\\pipe'
 
@@ -467,7 +475,7 @@ class EQClientGUI:
 
             if json_data['character'] != self.client_character_name:
                 # Match name to parse things like "Player's corpse123"
-                name_match = re.match(r"^\b(\w+)\b", json_data['character'])
+                name_match = RE_PLAYER_NAME_PATTERN.match(json_data['character'])
                 if not name_match:
                     return False
                 self.client_character_name = name_match.group(1)
@@ -484,27 +492,37 @@ class EQClientGUI:
             if json_data['type'] != 0:
                 return False
 
+            channel_no = json_data['data']['type']
+            if channel_no in CHANNEL_MAP:
+                msg_type = CHANNEL_MAP[channel_no]
+            else:
+                msg_type = None
+
             # Use server tick as a heartbeat
-            if json_data['data']['type'] == 0:
+            if channel_no == 0:
                 self.last_tick = time.time()
                 return False
 
             # Specified Channels only
-            if json_data['data']['type'] not in [
-                15,   # Yellow Text "Channel", inc Quake
-                259,  # Guild
-                310   # Guild Echo
+            if msg_type not in [
+                'guild',
+                # 'who',  # May be used in future for raid attendance
+                'yellow_text',
             ]:
                 return False
+            
+            message_text = json_data['data']['text']
 
             # Filter for yellow text "Channel"
-            if (json_data['data']['type'] == 15
-                    and not json_data['data']['text'].startswith("The next earthquake")
-                    and not json_data['data']['text'].startswith("PVP Druzzil Ro BROADCASTS")
-            ):
-                return False
+            if msg_type == 'yellow_text':
+                if message_text.startswith("The next earthquake"):
+                    msg_type = 'quake'
+                elif message_text.startswith("PVP Druzzil Ro BROADCASTS"):
+                    msg_type = 'boss'
+                else:
+                    return False
 
-            return json_data['data']['text']
+            return message_text, msg_type
 
         except json.JSONDecodeError as e:
             return False
@@ -514,12 +532,13 @@ class EQClientGUI:
             self.log(f"⚠️ Error processing pipe message: {e}")
             return False
 
-    def process_message(self, pipe_message):
+    def process_message(self, pipe_message, msg_type):
         """Looks for relevant data, modifies as nessacary"""
 
         # Format "You say to your guild" as "{Name} tells the guild" so duplicates can be matched
-        if pipe_message.startswith('You say to your guild'):
-            pipe_message = pipe_message.replace('You say to your guild', f'{self.client_character_name} tells the guild', 1)
+        if msg_type == 'guild':
+            if pipe_message.startswith('You say to your guild'):
+                pipe_message = pipe_message.replace('You say to your guild', f'{self.client_character_name} tells the guild', 1)
 
         return pipe_message
 
@@ -543,16 +562,16 @@ class EQClientGUI:
                 continue
             try:
                 new_message = self.pipe_queue.get(block=False)
-                extracted_message = self.extract_pipe_message(new_message)
-
-                if not extracted_message:
+                extract_message = self.extract_pipe_message(new_message)
+                if not extract_message:
                     time.sleep(0)
                     continue
 
-                message = self.process_message(extracted_message)
+                extracted_message, msg_type = extract_message
+                message = self.process_message(extracted_message, msg_type)
                 if message and self.websocket:
                     now = time.time()
-                    asyncio.run_coroutine_threadsafe(self.guild_message_queue.put([message, now]), self.loop)
+                    asyncio.run_coroutine_threadsafe(self.guild_message_queue.put([message, msg_type, now]), self.loop)
             except queue.Empty:
                 pass
             except Exception as e:
@@ -643,7 +662,7 @@ class EQClientGUI:
                     await asyncio.sleep(0.1)
                     continue
 
-                message, message_time = await self.guild_message_queue.get()
+                message, msg_type, message_time = await self.guild_message_queue.get()
 
                 current_time = time.time()
                 mesage_seconds_ago = current_time - message_time
@@ -652,7 +671,7 @@ class EQClientGUI:
                     await asyncio.sleep(0.1)
                     continue
 
-                payload = {"type": "guild_message", "message": message}
+                payload = {"msg_type": msg_type, "message": message}
 
                 try:
                     await ws.send(json.dumps(payload))
@@ -660,12 +679,12 @@ class EQClientGUI:
                 except websockets.ConnectionClosed:
                     self.log("⚠️ WebSocket connection closed during send — stopping sender.")
                     if self.guild_message_queue.empty():  # Retry if queue is still empty
-                        await self.guild_message_queue.put([message, message_time])
+                        await self.guild_message_queue.put([message, msg_type, message_time])
                     break
                 except Exception as e:
                     self.log(f"⚠️ Failed to send guild message: {e}")
                     if self.guild_message_queue.empty():  # Retry if queue is still empty
-                        await self.guild_message_queue.put([message, message_time])
+                        await self.guild_message_queue.put([message, msg_type, message_time])
                     await asyncio.sleep(1)
         except asyncio.CancelledError:
             self.log("ℹ️ Message sender cancelled cleanly.")
