@@ -17,7 +17,7 @@ import win32file
 import yaml
 
 
-VERSION = '0.2.0'
+VERSION = '0.3.1'
 CONFIG_FILE = "config.yaml"
 
 DEFAULT_CONFIG = {
@@ -517,8 +517,8 @@ class EQClientGUI:
             if msg_type == 'yellow_text':
                 if message_text.startswith("The next earthquake"):
                     msg_type = 'quake'
-                elif message_text.startswith("PVP Druzzil Ro BROADCASTS"):
-                    msg_type = 'boss'
+                elif message_text.startswith(("[PVP]", "PVP")):
+                    msg_type = 'pvp'
                 else:
                     return False
 
