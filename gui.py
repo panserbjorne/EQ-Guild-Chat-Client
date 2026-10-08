@@ -6,7 +6,8 @@ import re
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+import os
+from tkinter import ttk, scrolledtext, filedialog
 from datetime import datetime
 from typing import Callable
 
@@ -15,7 +16,7 @@ import pystray
 
 import icon_manager
 from config import (
-    APP_NAME, APP_VERSION,
+    APP_NAME, APP_VERSION, CAPTURE_FILE,
     SRV_KEY_CLIENTS, SRV_KEY_ACTIVE_SOURCE, SRV_KEY_VERSION,
 )
 from ws_client import WSClient
@@ -69,7 +70,12 @@ class App:
             on_character      = self._on_character_detected,
             on_log            = self._log,
             on_pipe_activity  = self._on_pipe_activity,
+            eq_dir            = self.config.eq_dir,
+            wants_kill        = lambda mob: self.ws.wants_kill(mob),
         )
+
+        if self.config.capture_packets:
+            self.pipe_reader.set_capture(CAPTURE_FILE)
 
         # WS is not started here — it starts when a character is detected
         self.pipe_reader.start()
@@ -278,12 +284,36 @@ class App:
             row=2, column=1, sticky="w", padx=(0, 10), pady=8
         )
 
+        # Packet capture checkbox (debugging aid)
+        ttk.Label(f, text="Capture packets:", anchor="e").grid(
+            row=3, column=0, sticky="e", padx=(10, 4), pady=8
+        )
+        self._var_capture_packets = tk.BooleanVar(value=self.config.capture_packets)
+        ttk.Checkbutton(
+            f, variable=self._var_capture_packets,
+            text=f"Write every Zeal packet to {CAPTURE_FILE}",
+        ).grid(row=3, column=1, sticky="w", padx=(0, 10), pady=8)
+
+        # EverQuest folder, for reading zone / PvP state back from the EQ log
+        ttk.Label(f, text="EverQuest folder:", anchor="e").grid(
+            row=4, column=0, sticky="e", padx=(10, 4), pady=8
+        )
+        eq_row = ttk.Frame(f)
+        eq_row.grid(row=4, column=1, sticky="ew", padx=(0, 10), pady=8)
+        eq_row.columnconfigure(0, weight=1)
+        self._ent_eq_dir = ttk.Entry(eq_row)
+        self._ent_eq_dir.insert(0, self.config.eq_dir)
+        self._ent_eq_dir.grid(row=0, column=0, sticky="ew")
+        ttk.Button(eq_row, text="Browse…", command=self._browse_eqgame).grid(
+            row=0, column=1, padx=(6, 0)
+        )
+
         # Whitelist / Blacklist
         list_frame = ttk.Frame(f)
-        list_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=10, pady=4)
+        list_frame.grid(row=5, column=0, columnspan=2, sticky="nsew", padx=10, pady=4)
         list_frame.columnconfigure(0, weight=1)
         list_frame.columnconfigure(1, weight=1)
-        f.rowconfigure(3, weight=1)
+        f.rowconfigure(5, weight=1)
 
         for col, (title, attr_box, is_white) in enumerate([
             ("Whitelisted Characters", "_wl_box", True),
@@ -318,7 +348,7 @@ class App:
         self._refresh_char_lists()
 
         ttk.Button(f, text="Save Settings", command=self._save_settings).grid(
-            row=4, column=0, columnspan=2, pady=12
+            row=6, column=0, columnspan=2, pady=12
         )
 
     def _apply_theme(self):
@@ -491,7 +521,8 @@ class App:
             self._pending_char_prompt.add(char)
             self._schedule(lambda c=char: self._prompt_new_character(c))
 
-    def _on_zeal_message(self, character: str, msg_type: str, text: str, is_sender: bool = False):
+    def _on_zeal_message(self, character: str, msg_type: str, text: str,
+                         is_sender: bool = False, extra: dict | None = None):
         self._log(f"[{msg_type.upper()}] {character}: {text}")
 
         if character in self.config.blacklist:
@@ -501,7 +532,7 @@ class App:
             self._log(f"[Filter] Blocked (not whitelisted): {character}")
             return
 
-        self.ws.send(msg_type, text, is_sender=is_sender)
+        self.ws.send(msg_type, text, is_sender=is_sender, extra=extra)
 
     # ─── New character dialog ─────────────────
 
@@ -560,10 +591,33 @@ class App:
 
     # ─── Settings actions ─────────────────────
 
+    def _browse_eqgame(self):
+        """Pick eqgame.exe; its folder is where EQ writes eqlog_*.txt."""
+        current = self._ent_eq_dir.get().strip()
+        path = filedialog.askopenfilename(
+            parent=self.root, title="Select eqgame.exe",
+            initialdir=current if os.path.isdir(current) else None,
+            filetypes=[("EverQuest", "eqgame.exe"), ("Programs", "*.exe")],
+        )
+        if path:
+            self._ent_eq_dir.delete(0, "end")
+            self._ent_eq_dir.insert(0, os.path.normpath(os.path.dirname(path)))
+
     def _save_settings(self):
+        eq_dir = self._ent_eq_dir.get().strip().strip('"')
+        if eq_dir.lower().endswith(".exe"):
+            eq_dir = os.path.dirname(eq_dir)
+        if eq_dir and not os.path.isfile(os.path.join(eq_dir, "eqgame.exe")):
+            self._log(f"[Config] No eqgame.exe in {eq_dir}; is that the EverQuest folder?")
+        self.config.eq_dir = eq_dir
+        self.pipe_reader.set_eq_dir(eq_dir)
         self.config.server_address  = self._ent_server.get().strip()
         self.config.api_key         = self._ent_apikey.get().strip()
         self.config.start_minimized = self._var_start_minimized.get()
+        capture = self._var_capture_packets.get()
+        if capture != self.config.capture_packets:
+            self.pipe_reader.set_capture(CAPTURE_FILE if capture else None)
+        self.config.capture_packets = capture
         self.config.save()
         self._log("[Config] Settings saved.")
 

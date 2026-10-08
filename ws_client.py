@@ -4,6 +4,7 @@ ws_client.py — Async WebSocket client running in a background thread.
 
 import asyncio
 import json
+import re
 import time
 import threading
 import uuid
@@ -15,7 +16,7 @@ from config import (
     Config, APP_VERSION,
     MSG_TYPE_REGISTER,
     SRV_TYPE_STATS, SRV_TYPE_ACK, SRV_TYPE_AUTH_ERROR,
-    SRV_TYPE_DUPLICATE_SESSION, SRV_TYPE_VERSION_NOTICE,
+    SRV_TYPE_DUPLICATE_SESSION, SRV_TYPE_VERSION_NOTICE, SRV_TYPE_WATCH,
     SRV_KEY_CLIENTS, SRV_KEY_ACTIVE_SOURCE, SRV_KEY_VERSION,
 )
 
@@ -25,6 +26,16 @@ ACK_TIMEOUT = 10
 # Drop queued outgoing messages older than this (seconds) — avoids flooding
 # the server with a backlog of stale chat lines after a long disconnect.
 MESSAGE_MAX_AGE = 10
+
+
+def mob_key(name: str) -> str:
+    """
+    The server's key for a mob name ('#Lord_Bob01' and 'lord bob' are the
+    same mob); must match spawn_tracker._norm on the server.
+    """
+    name = (name or "").replace("#", "").replace("_", " ")
+    name = re.sub(r"\d+$", "", name.strip())
+    return re.sub(r"\s+", " ", name).strip().lower()
 
 
 class WSClient:
@@ -78,6 +89,10 @@ class WSClient:
         self._pending_acks: dict[str, tuple[float, str]]        = {}
         self._acks_lock:    threading.Lock                      = threading.Lock()
 
+        # Mob keys the server records kills of (its "watch" message); None
+        # until it sends one, and then every kill is reported
+        self._watched:      Optional[frozenset[str]]            = None
+
     # ─── Public API ───────────────────────────
 
     def start(self):
@@ -94,15 +109,23 @@ class WSClient:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
 
-    def send(self, msg_type: str, message: str, is_sender: bool = False):
+    def wants_kill(self, mob: str) -> bool:
+        """Whether a kill of this mob is worth sending (thread-safe)."""
+        watched = self._watched
+        return watched is None or mob_key(mob) in watched
+
+    def send(self, msg_type: str, message: str, is_sender: bool = False,
+             extra: Optional[dict] = None):
         """Queue an outgoing message (thread-safe). Includes character, timestamp, client_id.
         is_sender=True indicates this client's character typed the message (GUILD_TX),
         so the server can use it as the canonical version for deduplication.
+        extra adds structured fields to the payload (e.g. mob/zone for kills).
         """
         if self._loop and self._loop.is_running() and self._send_queue:
             msg_id  = str(uuid.uuid4())
             queued_at = time.time()
             payload = json.dumps({
+                **(extra or {}),
                 "msg_type":  msg_type,
                 "message":   message,
                 "character": self.character,
@@ -151,6 +174,8 @@ class WSClient:
             self.on_status("Connecting…")
             try:
                 async with websockets.connect(url, additional_headers=headers) as ws:
+                    # A server too old to send a watch list gets every kill
+                    self._watched = None
                     # Send registration handshake immediately on connect
                     await self._send_register(ws)
                     self.on_status("Connected")
@@ -223,6 +248,10 @@ class WSClient:
 
         elif msg_type == SRV_TYPE_VERSION_NOTICE:
             self.on_log(f"[WS] Version notice: {data.get('message', '')}")
+
+        elif msg_type == SRV_TYPE_WATCH:
+            self._watched = frozenset(data.get("mobs") or [])
+            self.on_log(f"[WS] Reporting kills of {len(self._watched)} watched mobs")
 
         else:
             # Unknown message type — log it for debugging

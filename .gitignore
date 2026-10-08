@@ -1,4 +1,5 @@
 config.yaml
+zone_state.json
 *.exe
 
 # Byte-compiled / optimized / DLL files
