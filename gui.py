@@ -7,6 +7,7 @@ import threading
 import time
 import tkinter as tk
 import os
+import webbrowser
 from tkinter import ttk, scrolledtext, filedialog
 from datetime import datetime
 from typing import Callable
@@ -20,6 +21,7 @@ from config import (
     SRV_KEY_CLIENTS, SRV_KEY_ACTIVE_SOURCE, SRV_KEY_VERSION,
 )
 from ws_client import WSClient
+from discord_signin import DiscordSignIn
 from pipe_reader import ZealPipeReader
 
 
@@ -268,12 +270,19 @@ class App:
         self._ent_server.insert(0, self.config.server_address)
         self._ent_server.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=8)
 
-        ttk.Label(f, text="API Key:", anchor="e").grid(
+        # Discord sign-in: the server gives this PC its own token
+        ttk.Label(f, text="Account:", anchor="e").grid(
             row=1, column=0, sticky="e", padx=(10, 4), pady=8
         )
-        self._ent_apikey = ttk.Entry(f, show="●")
-        self._ent_apikey.insert(0, self.config.api_key)
-        self._ent_apikey.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=8)
+        acct_row = ttk.Frame(f)
+        acct_row.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=8)
+        acct_row.columnconfigure(0, weight=1)
+        self._lbl_account = ttk.Label(acct_row)
+        self._lbl_account.grid(row=0, column=0, sticky="w")
+        self._btn_signin = ttk.Button(acct_row, command=self._toggle_signin)
+        self._btn_signin.grid(row=0, column=1, padx=(6, 0))
+        self._btn_signout = ttk.Button(acct_row, text="Sign out", command=self._sign_out)
+        self._btn_signout.grid(row=0, column=2, padx=(6, 0))
 
         # Start minimized checkbox
         ttk.Label(f, text="Start minimized:", anchor="e").grid(
@@ -284,22 +293,12 @@ class App:
             row=2, column=1, sticky="w", padx=(0, 10), pady=8
         )
 
-        # Packet capture checkbox (debugging aid)
-        ttk.Label(f, text="Capture packets:", anchor="e").grid(
-            row=3, column=0, sticky="e", padx=(10, 4), pady=8
-        )
-        self._var_capture_packets = tk.BooleanVar(value=self.config.capture_packets)
-        ttk.Checkbutton(
-            f, variable=self._var_capture_packets,
-            text=f"Write every Zeal packet to {CAPTURE_FILE}",
-        ).grid(row=3, column=1, sticky="w", padx=(0, 10), pady=8)
-
         # EverQuest folder, for reading zone / PvP state back from the EQ log
         ttk.Label(f, text="EverQuest folder:", anchor="e").grid(
-            row=4, column=0, sticky="e", padx=(10, 4), pady=8
+            row=3, column=0, sticky="e", padx=(10, 4), pady=8
         )
         eq_row = ttk.Frame(f)
-        eq_row.grid(row=4, column=1, sticky="ew", padx=(0, 10), pady=8)
+        eq_row.grid(row=3, column=1, sticky="ew", padx=(0, 10), pady=8)
         eq_row.columnconfigure(0, weight=1)
         self._ent_eq_dir = ttk.Entry(eq_row)
         self._ent_eq_dir.insert(0, self.config.eq_dir)
@@ -310,10 +309,10 @@ class App:
 
         # Whitelist / Blacklist
         list_frame = ttk.Frame(f)
-        list_frame.grid(row=5, column=0, columnspan=2, sticky="nsew", padx=10, pady=4)
+        list_frame.grid(row=4, column=0, columnspan=2, sticky="nsew", padx=10, pady=4)
         list_frame.columnconfigure(0, weight=1)
         list_frame.columnconfigure(1, weight=1)
-        f.rowconfigure(5, weight=1)
+        f.rowconfigure(4, weight=1)
 
         for col, (title, attr_box, is_white) in enumerate([
             ("Whitelisted Characters", "_wl_box", True),
@@ -347,9 +346,78 @@ class App:
 
         self._refresh_char_lists()
 
-        ttk.Button(f, text="Save Settings", command=self._save_settings).grid(
-            row=6, column=0, columnspan=2, pady=12
+        # Advanced: settings most people never need, hidden until asked for
+        adv_head = ttk.Frame(f, cursor="hand2")
+        adv_head.grid(row=5, column=0, columnspan=2, sticky="ew", padx=10, pady=(10, 0))
+        adv_head.columnconfigure(1, weight=1)
+        self._lbl_advanced = ttk.Label(adv_head, foreground=self.ACC, cursor="hand2",
+                                       font=("Segoe UI", 10, "bold"))
+        self._lbl_advanced.grid(row=0, column=0, sticky="w")
+        ttk.Separator(adv_head).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        for w in (adv_head, self._lbl_advanced):
+            w.bind("<Button-1>", lambda e: self._toggle_advanced())
+
+        # Older servers, or anyone who'd rather paste a key from the setup page
+        lbl_key = ttk.Label(f, text="API Key:", anchor="e")
+        lbl_key.grid(row=6, column=0, sticky="e", padx=(10, 4), pady=8)
+        self._ent_apikey = ttk.Entry(f, show="●")
+        self._ent_apikey.insert(0, self.config.api_key)
+        self._ent_apikey.grid(row=6, column=1, sticky="ew", padx=(0, 10), pady=8)
+
+        # Packet capture checkbox (debugging aid)
+        lbl_capture = ttk.Label(f, text="Capture packets:", anchor="e")
+        lbl_capture.grid(row=7, column=0, sticky="e", padx=(10, 4), pady=8)
+        self._var_capture_packets = tk.BooleanVar(value=self.config.capture_packets)
+        chk_capture = ttk.Checkbutton(
+            f, variable=self._var_capture_packets,
+            text=f"Write every Zeal packet to {CAPTURE_FILE}",
         )
+        chk_capture.grid(row=7, column=1, sticky="w", padx=(0, 10), pady=8)
+        self._advanced_widgets = [lbl_key, self._ent_apikey, lbl_capture, chk_capture]
+
+        # Open already if something in it is in use
+        using_key = bool(self.config.api_key) and not self.config.signed_in_as
+        self._show_advanced(using_key or self.config.capture_packets)
+
+        self._signin = None
+        self._refresh_account()
+
+        ttk.Button(f, text="Save Settings", command=self._save_settings).grid(
+            row=8, column=0, columnspan=2, pady=12
+        )
+
+    def _show_advanced(self, show: bool):
+        self._advanced_open = show
+        for w in self._advanced_widgets:
+            if show:
+                w.grid()
+            else:
+                w.grid_remove()
+        self._fit_advanced(show)
+        self._lbl_advanced.config(text=("▾" if show else "▸") + "  Advanced")
+
+    def _fit_advanced(self, opened: bool):
+        """
+        Grow the window when Advanced opens so the character lists keep their
+        buttons, and give that height back when it closes.
+        """
+        if self.root.state() == "zoomed":
+            return   # maximised: there's room already
+        self.root.update_idletasks()
+        mapped = self.root.winfo_ismapped()
+        width  = self.root.winfo_width()  if mapped else 720
+        height = self.root.winfo_height() if mapped else 560
+        if opened:
+            need = self.root.winfo_reqheight()
+            if need > height:
+                self._height_before_advanced = height
+                self.root.geometry(f"{width}x{need}")
+        elif getattr(self, "_height_before_advanced", None):
+            self.root.geometry(f"{width}x{self._height_before_advanced}")
+            self._height_before_advanced = None
+
+    def _toggle_advanced(self):
+        self._show_advanced(not self._advanced_open)
 
     def _apply_theme(self):
         style = ttk.Style()
@@ -363,6 +431,7 @@ class App:
         style.configure("TLabelframe",       background=bg, foreground=fg,
                                              bordercolor="#2e3340", relief="groove")
         style.configure("TLabelframe.Label", background=bg, foreground=acc)
+        style.configure("TSeparator",        background="#2e3340")
         style.configure("TNotebook",         background=bg, borderwidth=0)
         style.configure("TNotebook.Tab",     background=panel, foreground=fg,
                                              padding=[12, 6], font=("Segoe UI", 10))
@@ -612,7 +681,10 @@ class App:
         self.config.eq_dir = eq_dir
         self.pipe_reader.set_eq_dir(eq_dir)
         self.config.server_address  = self._ent_server.get().strip()
-        self.config.api_key         = self._ent_apikey.get().strip()
+        api_key = self._ent_apikey.get().strip()
+        if api_key != self.config.api_key:
+            self.config.signed_in_as = ""   # a pasted key replaces the Discord sign-in
+        self.config.api_key         = api_key
         self.config.start_minimized = self._var_start_minimized.get()
         capture = self._var_capture_packets.get()
         if capture != self.config.capture_packets:
@@ -620,7 +692,11 @@ class App:
         self.config.capture_packets = capture
         self.config.save()
         self._log("[Config] Settings saved.")
+        self._refresh_account()
+        self._restart_ws()
 
+    def _restart_ws(self):
+        """Reconnect with the current settings."""
         # Only restart the WS connection if it was actually running — keeps
         # _ws_connected in sync so the pipe watchdog doesn't double-start it.
         was_connected = self._ws_connected
@@ -631,6 +707,95 @@ class App:
             self._log("[Config] Reconnecting…")
             self.ws.start()
             self._ws_connected = True
+
+    # ─── Discord sign-in ──────────────────────
+
+    def _refresh_account(self):
+        """Show who this client is signed in as, and which buttons apply."""
+        if self._signin:
+            self._lbl_account.config(text="Waiting for you to approve in your browser…",
+                                     foreground=self.FG)
+            self._btn_signin.config(text="Cancel")
+            self._btn_signout.grid_remove()
+        elif self.config.signed_in_as:
+            self._lbl_account.config(text=f"Signed in as {self.config.signed_in_as}",
+                                     foreground="#4ec97e")
+            self._btn_signin.config(text="Sign in again")
+            self._btn_signout.grid()
+        elif self.config.api_key:
+            self._lbl_account.config(text="Using an API key", foreground=self.FG)
+            self._btn_signin.config(text="Sign in with Discord")
+            self._btn_signout.grid_remove()
+        else:
+            self._lbl_account.config(text="Not signed in", foreground=self.ERR)
+            self._btn_signin.config(text="Sign in with Discord")
+            self._btn_signout.grid_remove()
+        self._ent_apikey.config(state="disabled" if self.config.signed_in_as else "normal")
+
+    def _toggle_signin(self):
+        if self._signin:
+            self._signin.cancel()
+            self._signin = None
+            self._log("[Sign-in] Cancelled.")
+            self._refresh_account()
+            return
+        server = self._ent_server.get().strip()
+        if not server:
+            self._log("[Sign-in] Enter the server address first.")
+            return
+        self._log("[Sign-in] Asking the server for a sign-in link…")
+        attempt = DiscordSignIn(
+            server,
+            on_url   = lambda url: self._schedule(lambda: self._signin_url(attempt, url)),
+            on_done  = lambda token, name: self._schedule(
+                lambda: self._signin_done(attempt, server, token, name)),
+            on_error = lambda reason: self._schedule(lambda: self._signin_failed(attempt, reason)),
+        )
+        self._signin = attempt
+        self._refresh_account()
+        attempt.start()
+
+    def _signin_url(self, attempt, url: str):
+        if attempt is not self._signin:
+            return
+        self._log(f"[Sign-in] Opening {url}")
+        self._log("[Sign-in] If no browser opened, copy that link into one.")
+        webbrowser.open(url)
+
+    def _signin_done(self, attempt, server: str, token: str, name: str):
+        if attempt is not self._signin:
+            return
+        self._signin = None
+        self.config.server_address = server
+        self.config.api_key        = token
+        self.config.signed_in_as   = name or "your Discord account"
+        self.config.save()
+        self._ent_apikey.config(state="normal")
+        self._ent_apikey.delete(0, "end")
+        self._ent_apikey.insert(0, token)
+        self._refresh_account()
+        self._log(f"[Sign-in] Signed in as {self.config.signed_in_as}.")
+        self._restart_ws()
+
+    def _signin_failed(self, attempt, reason: str):
+        if attempt is not self._signin:
+            return
+        self._signin = None
+        self._refresh_account()
+        self._log(f"[Sign-in] {reason}")
+        self._lbl_account.config(text=reason, foreground=self.ERR)
+
+    def _sign_out(self):
+        """Forget this PC's token. It stays listed on the setup page until removed there."""
+        self.config.api_key      = ""
+        self.config.signed_in_as = ""
+        self.config.save()
+        self._ent_apikey.config(state="normal")
+        self._ent_apikey.delete(0, "end")
+        self._refresh_account()
+        self._log("[Sign-in] Signed out. Remove this PC under Your PCs on the setup page to "
+                  "cancel its token on the server too.")
+        self._restart_ws()
 
     def _refresh_char_lists(self):
         for lb, items in [

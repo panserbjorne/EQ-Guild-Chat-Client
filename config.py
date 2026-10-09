@@ -13,7 +13,7 @@ import yaml
 # ─────────────────────────────────────────────
 
 APP_NAME    = "EQ Guild Chat Client"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 CONFIG_FILE = "config.yaml"
 CAPTURE_FILE = "packet_capture.log"   # written when packet capture is enabled
 ZONE_STATE_FILE = "zone_state.json"   # each character's last zone copy, kept across logins
@@ -107,7 +107,8 @@ class Config:
 
     def __init__(self):
         self.server_address:  str       = "ws://localhost:8765"
-        self.api_key:         str       = ""
+        self.api_key:         str       = ""   # API key, or the token from signing in with Discord
+        self.signed_in_as:    str       = ""   # Discord member the token belongs to; "" = API key
         self.client_id:       str       = ""
         self.whitelist:       list[str] = []
         self.blacklist:       list[str] = []
@@ -134,6 +135,7 @@ class Config:
 
             self.server_address  = srv.get("address",        self.server_address)
             self.api_key         = srv.get("api_key",         self.api_key)
+            self.signed_in_as    = srv.get("signed_in_as",    "") or ""
             self.client_id       = srv.get("client_id",       "")
             self.start_minimized = bool(app.get("start_minimized", self.start_minimized))
             self.capture_packets = bool(app.get("capture_packets", self.capture_packets))
@@ -152,6 +154,7 @@ class Config:
             "server": {
                 "address":   self.server_address,
                 "api_key":   self.api_key,
+                "signed_in_as": self.signed_in_as,
                 "client_id": self.client_id,
             },
             "app": {

@@ -243,7 +243,7 @@ class WSClient:
         elif msg_type == SRV_TYPE_AUTH_ERROR:
             reason = data.get("reason", "Authentication failed.")
             self.on_log(f"[WS] AUTH ERROR: {reason}")
-            self.on_fatal(f"Authentication failed.\n\n{reason}\n\nCheck your API key in Settings.")
+            self.on_fatal(f"Authentication failed.\n\n{reason}\n\nSign in with Discord again in Settings.")
             self._running = False
 
         elif msg_type == SRV_TYPE_VERSION_NOTICE:
