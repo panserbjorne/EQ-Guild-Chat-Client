@@ -17,6 +17,7 @@ APP_VERSION = "0.5.1"
 CONFIG_FILE = "config.yaml"
 CAPTURE_FILE = "packet_capture.log"   # written when packet capture is enabled
 ZONE_STATE_FILE = "zone_state.json"   # each character's last zone copy, kept across logins
+COMBAT_FILE  = "combat_batches.jsonl"  # combat batches, written when the combat dry run is on
 
 # ─────────────────────────────────────────────
 # Zeal pipe constants
@@ -26,6 +27,8 @@ ZONE_STATE_FILE = "zone_state.json"   # each character's last zone copy, kept ac
 ZEAL_PACKET_CHAT  = 0   # single chat message
 ZEAL_PACKET_STATS = 1   # combined stats array (HP, mana, target, etc.)
 ZEAL_PACKET_PLAYER = 3  # player state (zone id, location, target); sent on movement/target change
+ZEAL_PACKET_RAID   = 5  # raid members: name, class id, level, group (only while in a raid)
+ZEAL_PACKET_GROUP  = 6  # group members (class/level only with Zeal's PipeVerbose on)
 
 # Inner channel type IDs (the "type" field inside "data" for chat packets)
 ZEAL_TYPE_SYSTEM   = 13    # system text (zoning, PvP toggle)
@@ -37,10 +40,17 @@ ZEAL_TYPE_WHO      = 281   # /who results
 ZEAL_TYPE_GUILD_TX = 310   # guild chat sent by us
 
 # Inner type IDs within the stats array (outer type 1)
+ZEAL_STAT_NAME      = 1    # this character's name
+ZEAL_STAT_LEVEL     = 2    # this character's level
+ZEAL_STAT_CLASS     = 3    # this character's class, as text ("Bard")
 ZEAL_STAT_HP_PCT    = 19   # HP percent
 ZEAL_STAT_MANA_PCT  = 20   # mana percent
 ZEAL_STAT_TARGET    = 28   # target name
 ZEAL_STAT_TARGET_HP = 29   # target HP percent
+ZEAL_STAT_TARGET_PET_OWNER = 82   # owner of the targeted pet ("" when the target isn't a pet)
+ZEAL_STAT_PET_NAME  = 68   # this character's pet name ("" without a pet)
+ZEAL_STAT_CASTING   = 134  # spell being cast right now ("" when not casting)
+ZEAL_STAT_BUFFS     = tuple(range(45, 60)) + tuple(range(135, 141))   # Buff0..Buff20: our buffs' spell names
 
 # ─────────────────────────────────────────────
 # Server → client message types
@@ -70,6 +80,7 @@ MSG_TYPE_TIME     = "time"
 MSG_TYPE_WHO      = "who"
 MSG_TYPE_KILL     = "kill"   # NPC kill seen by this client, with zone + PvP context
 MSG_TYPE_ZONE     = "zone"   # this client entered a zone (server logs the copy; temporary)
+MSG_TYPE_COMBAT   = "combat" # one second of boss fight combat lines (see combat.py)
 
 # ─────────────────────────────────────────────
 # Yellow-text filter patterns
@@ -114,6 +125,8 @@ class Config:
         self.blacklist:       list[str] = []
         self.start_minimized: bool      = False
         self.capture_packets: bool      = False
+        self.send_combat:     bool      = True    # send boss fight damage for the website
+        self.combat_dry_run:  bool      = False   # also write combat batches to COMBAT_FILE
         self.icon_dir:        str       = "icons"
         self.icon_name:       str       = "icon.png"
         self.eq_dir:          str       = ""   # EQ folder for log fallback; "" = auto
@@ -139,6 +152,8 @@ class Config:
             self.client_id       = srv.get("client_id",       "")
             self.start_minimized = bool(app.get("start_minimized", self.start_minimized))
             self.capture_packets = bool(app.get("capture_packets", self.capture_packets))
+            self.send_combat     = bool(app.get("send_combat",     self.send_combat))
+            self.combat_dry_run  = bool(app.get("combat_dry_run",  self.combat_dry_run))
             self.icon_dir        = app.get("icon_dir",        self.icon_dir)
             self.icon_name       = app.get("icon_name",       self.icon_name)
             self.eq_dir          = app.get("eq_dir",          self.eq_dir) or ""
@@ -160,6 +175,8 @@ class Config:
             "app": {
                 "start_minimized": self.start_minimized,
                 "capture_packets": self.capture_packets,
+                "send_combat":     self.send_combat,
+                "combat_dry_run":  self.combat_dry_run,
                 "icon_dir":        self.icon_dir,
                 "icon_name":       self.icon_name,
                 "eq_dir":          self.eq_dir,

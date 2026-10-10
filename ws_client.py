@@ -114,12 +114,21 @@ class WSClient:
         watched = self._watched
         return watched is None or mob_key(mob) in watched
 
+    def wants_combat(self, mob: str) -> bool:
+        """
+        Whether a mob is a boss worth sending combat for (thread-safe). Unlike
+        kills, nothing is sent until the server has sent its watch list.
+        """
+        watched = self._watched
+        return watched is not None and mob_key(mob) in watched
+
     def send(self, msg_type: str, message: str, is_sender: bool = False,
-             extra: Optional[dict] = None):
+             extra: Optional[dict] = None, track_ack: bool = True):
         """Queue an outgoing message (thread-safe). Includes character, timestamp, client_id.
         is_sender=True indicates this client's character typed the message (GUILD_TX),
         so the server can use it as the canonical version for deduplication.
         extra adds structured fields to the payload (e.g. mob/zone for kills).
+        track_ack=False skips the missing-ack warning (combat batches, once a second).
         """
         if self._loop and self._loop.is_running() and self._send_queue:
             msg_id  = str(uuid.uuid4())
@@ -134,8 +143,9 @@ class WSClient:
                 "msg_id":    msg_id,
                 "is_sender": is_sender,
             })
-            with self._acks_lock:
-                self._pending_acks[msg_id] = (queued_at, f"{msg_type}: {message[:60]}")
+            if track_ack:
+                with self._acks_lock:
+                    self._pending_acks[msg_id] = (queued_at, f"{msg_type}: {message[:60]}")
             self._loop.call_soon_threadsafe(self._send_queue.put_nowait, (queued_at, payload))
 
     # ─── Event loop ───────────────────────────
@@ -266,7 +276,8 @@ class WSClient:
                     continue
                 try:
                     await ws.send(payload)
-                    self.on_log(f"[WS] Sent: {payload}")
+                    shown = payload if len(payload) <= 500 else f"{payload[:500]}… ({len(payload)} bytes)"
+                    self.on_log(f"[WS] Sent: {shown}")
                 except Exception as e:
                     self.on_log(f"[WS] Send error: {e} — requeueing message")
                     # Put it back at the front so it's retried on reconnect

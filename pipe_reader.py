@@ -54,6 +54,18 @@ character:
                                  are saved to ZONE_STATE_FILE and restored
                                  when they log back into that zone
 
+Combat capture
+--------------
+Every chat line also goes to the character's CombatTracker (combat.py),
+which keeps the last minute of combat lines and starts streaming them once
+a watched mob (the server's watchlist) appears. Once a second, each
+tracker's new lines go out as one MSG_TYPE_COMBAT batch with the
+character's pet name (stats label 68) and zone, and its HP, mana and
+location (and its raid's, and a targeted boss's) when they change, and optionally to
+COMBAT_FILE as one JSON object per line (the dry run). The first batch of a
+fight, and any batch after the roster changes, also carries the classes and
+levels of the character, its group and its raid (raid / group packets).
+
 When the client starts after the character zoned or toggled PvP, the
 zone and PvP state are read back from the character's EQ log file
 (eq_log.py), which needs logging on in game (/log on). Live lines always
@@ -73,14 +85,17 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import eq_log
+from combat import CombatTracker
 
 from config import (
-    ZONE_STATE_FILE,
+    ZONE_STATE_FILE, MSG_TYPE_COMBAT, ZEAL_STAT_PET_NAME, ZEAL_STAT_CASTING,
+    ZEAL_STAT_NAME, ZEAL_STAT_LEVEL, ZEAL_STAT_CLASS,
     ZEAL_PACKET_CHAT, ZEAL_PACKET_STATS, ZEAL_PACKET_PLAYER,
+    ZEAL_PACKET_RAID, ZEAL_PACKET_GROUP,
     ZEAL_TYPE_SYSTEM, ZEAL_TYPE_DEATH, MSG_TYPE_KILL, MSG_TYPE_ZONE,
     RE_KILL_YOU, RE_KILL_OTHER, RE_KILL_DIED, RE_ZONE_ENTER, RE_PVP_ON, RE_PVP_OFF,
     RE_LOADING, RE_CAMPING, RE_NO_MERCHANT, RE_NO_HORSE,
-    ZEAL_STAT_HP_PCT, ZEAL_STAT_MANA_PCT, ZEAL_STAT_TARGET, ZEAL_STAT_TARGET_HP,
+    ZEAL_STAT_HP_PCT, ZEAL_STAT_MANA_PCT, ZEAL_STAT_TARGET, ZEAL_STAT_TARGET_HP, ZEAL_STAT_TARGET_PET_OWNER, ZEAL_STAT_BUFFS,
     ZEAL_TYPE_YELLOW, ZEAL_TYPE_DEFAULT,
     ZEAL_TYPE_GUILD_RX, ZEAL_TYPE_GUILD_TX, ZEAL_TYPE_WHO, MSG_TYPE_GUILD,
     MSG_TYPE_QUAKE, MSG_TYPE_WHO, MSG_TYPE_PVP, MSG_TYPE_TIME,
@@ -165,6 +180,8 @@ class ZealPipeReader(threading.Thread):
         on_pipe_activity: Callable[[], None] | None = None,
         eq_dir:          str = "",
         wants_kill:      Callable[[str], bool] | None = None,
+        wants_combat:    Callable[[str], bool] | None = None,
+        send_combat:     bool = True,
     ):
         super().__init__(daemon=True)
         self.on_message      = on_message
@@ -172,6 +189,16 @@ class ZealPipeReader(threading.Thread):
         self.on_log          = on_log
         self.on_pipe_activity = on_pipe_activity
         self.wants_kill      = wants_kill        # mob name → worth reporting; None = all
+        self.wants_combat    = wants_combat or (lambda mob: False)  # mob name → a boss fight
+        self._send_combat    = send_combat
+        self._combat: dict[str, CombatTracker] = {}  # character → combat tracker
+        self._pets:   dict[str, str] = {}             # character → pet name
+        self._selves: dict[str, dict] = {}            # character → its own class / level
+        self._raids:  dict[str, tuple] = {}           # character → (time, {name: class/level})
+        self._groups: dict[str, tuple] = {}           # character → (time, {name: class/level})
+        self._roster_sent: dict[str, tuple] = {}      # character → (fight_start, roster) last sent
+        self._combat_path: Optional[str] = None       # dry run file; None = off
+        self._combat_lock = threading.Lock()
         self._stop_event  = threading.Event()
         self._active_pipes: dict[str, dict] = {}
         self._state       = ZealState()
@@ -185,6 +212,7 @@ class ZealPipeReader(threading.Thread):
         self._capture_lock = threading.Lock()
         self._capture_last: dict[tuple, str] = {}   # (character, type) → last data written
         self._batched_seen = False                    # logged that reads can hold several packets
+        self._read = threading.local()                # read_at: when the worker's current bytes came off the pipe
 
     def stop(self):
         self._stop_event.set()
@@ -204,9 +232,24 @@ class ZealPipeReader(threading.Thread):
         else:
             self.on_log("[Pipe] Packet capture OFF")
 
+    def set_send_combat(self, on: bool):
+        """Turn sending boss fight combat batches on or off."""
+        self._send_combat = on
+        self.on_log(f"[Combat] Sending boss fight damage {'ON' if on else 'OFF'}")
+
+    def set_combat_file(self, path: Optional[str]):
+        """Also write every combat batch to `path`, or stop if None."""
+        with self._combat_lock:
+            self._combat_path = path
+        if path:
+            self.on_log(f"[Combat] Dry run ON → {os.path.abspath(path)}")
+        else:
+            self.on_log("[Combat] Dry run OFF")
+
     # ─── Scan loop ────────────────────────────
 
     def run(self):
+        threading.Thread(target=self._combat_loop, daemon=True).start()
         while not self._stop_event.is_set():
             self._scan_pipes()
             time.sleep(2)
@@ -301,7 +344,9 @@ class ZealPipeReader(threading.Thread):
                         return
 
                 if chunks:
-                    q.put(b"".join(chunks))
+                    # Stamped here, not when parsed: Zeal sends no times, and
+                    # the queue can back up during a busy fight
+                    q.put((time.time(), b"".join(chunks)))
 
         except Exception as e:
             self.on_log(f"[Pipe] Reader error on {pipe_path}: {e}")
@@ -325,7 +370,8 @@ class ZealPipeReader(threading.Thread):
                 if item is _STOP:
                     break
                 try:
-                    buf += utf8.decode(item)
+                    self._read.read_at, data = item
+                    buf += utf8.decode(data)
                     buf, stuck = self._drain(buf, stuck, pipe_path)
                 except Exception as e:
                     buf, stuck = "", False
@@ -409,10 +455,13 @@ class ZealPipeReader(threading.Thread):
                 self._handle_chat(character, data)
 
             elif outer_type == ZEAL_PACKET_STATS:
-                self._handle_stats(packet.get("data", ""))
+                self._handle_stats(character, packet.get("data", ""))
 
             elif outer_type == ZEAL_PACKET_PLAYER:
                 self._handle_player(character, packet.get("data", ""))
+
+            elif outer_type in (ZEAL_PACKET_RAID, ZEAL_PACKET_GROUP) and character:
+                self._handle_members(character, outer_type, packet.get("data", ""))
 
         except Exception as e:
             self.on_log(f"[Pipe] Parse error: {e} | packet={str(packet)[:120]}")
@@ -462,27 +511,69 @@ class ZealPipeReader(threading.Thread):
 
     # ─── Stat/target caching ──────────────────
 
-    def _handle_stats(self, data_raw: str):
-        """Update HP, mana, target name and target HP from the combined stats array."""
+    def _handle_stats(self, character: str, data_raw: str):
+        """Update HP, mana, target name, target HP and pet name from the combined stats array."""
         try:
             items = json.loads(data_raw) if isinstance(data_raw, str) else data_raw
             if not isinstance(items, list):
                 return
             with self._state_lock:
+                pet = ""   # Zeal leaves the pet label out entirely when there's no pet
+                me  = {}
+                target, target_owner, target_hp = "", "", None
+                buffs = None   # stays None when the packet carries no buff labels
+                casting = None
+                hp, mana = None, None
                 for item in items:
                     t = item.get("type")
                     v = item.get("value", "")
                     try:
                         if t == ZEAL_STAT_HP_PCT:
-                            self._state.hp_pct = int(v)
+                            self._state.hp_pct = hp = int(v)
+                            casting = "" if casting is None else casting   # a full packet: no label = idle
                         elif t == ZEAL_STAT_MANA_PCT:
-                            self._state.mana_pct = int(v)
+                            self._state.mana_pct = mana = int(v)
                         elif t == ZEAL_STAT_TARGET:
                             self._state.target = str(v)
+                            target = str(v)
+                        elif t == ZEAL_STAT_TARGET_PET_OWNER:
+                            target_owner = str(v)
                         elif t == ZEAL_STAT_TARGET_HP:
                             self._state.target_hp = int(v)
+                            target_hp = int(v)
+                        elif t == ZEAL_STAT_PET_NAME:
+                            pet = str(v).strip()
+                        elif t == ZEAL_STAT_LEVEL:
+                            me["level"] = int(v)
+                        elif t == ZEAL_STAT_CLASS:
+                            me["class"] = str(v).strip()
+                        elif t in ZEAL_STAT_BUFFS:
+                            buffs = buffs if buffs is not None else set()
+                            if str(v).strip():
+                                buffs.add(str(v).strip())
+                        elif t == ZEAL_STAT_CASTING:
+                            casting = str(v).strip()
                     except (ValueError, TypeError):
                         pass
+                if character:
+                    self._pets[character] = pet
+                    if target and target_owner:
+                        self._combat_tracker(character).pet_owner(target, target_owner)
+                    if casting is not None:
+                        # What we're casting and at whom, for our own casts and their lands
+                        self._combat_tracker(character).casting(
+                            casting, now=getattr(self._read, "read_at", None), target=target)
+                    if buffs is not None:
+                        self._combat_tracker(character).buffs(
+                            buffs, now=getattr(self._read, "read_at", None))
+                    if target and target_hp is not None:
+                        self._combat_tracker(character).target_hp(
+                            target, target_hp, now=getattr(self._read, "read_at", None))
+                    if hp is not None:
+                        self._combat_tracker(character).vitals(
+                            hp, mana, now=getattr(self._read, "read_at", None))
+                    if me:
+                        self._selves[character] = me
         except Exception:
             pass
 
@@ -540,6 +631,16 @@ class ZealPipeReader(threading.Thread):
             loc = data.get("location") or {}
             if "x" in loc and "y" in loc:
                 st.loc = (round(loc["x"], 1), round(loc["y"], 1))
+                self._combat_tracker(character).location(
+                    float(loc["x"]), float(loc["y"]), float(loc["z"]) if "z" in loc else None,
+                    now=getattr(self._read, "read_at", None))
+                tloc = data.get("target_loc") or {}
+                if data.get("target_name") and "x" in tloc and "y" in tloc:
+                    # Our target's position (Zeal sends it only while it's close): kept for bosses
+                    self._combat_tracker(character).other_location(
+                        str(data["target_name"]), float(tloc["x"]), float(tloc["y"]),
+                        float(tloc["z"]) if "z" in tloc else None,
+                        now=getattr(self._read, "read_at", None), boss=True)
                 # Moving around means we're in game (client started mid-session)
                 if not st.camped:
                     st.login = False
@@ -640,11 +741,110 @@ class ZealPipeReader(threading.Thread):
             "instance": st.hint,
         })
 
+    def _handle_members(self, character: str, outer_type: int, data_raw):
+        """Raid / group packets: who's with this character, and their classes."""
+        try:
+            data = json.loads(data_raw) if isinstance(data_raw, str) else data_raw
+            if not isinstance(data, list):
+                return
+            members = {}
+            tracker = self._combat_tracker(character)
+            now = getattr(self._read, "read_at", None)
+            for m in data:
+                name = m.get("name") if isinstance(m, dict) else None
+                if name:
+                    members[name] = {k: m[k] for k in ("class", "level") if k in m}
+                    loc = m.get("loc") or {}
+                    if "x" in loc and "y" in loc:
+                        # Where they are, for the fight's map (only members in the zone have one)
+                        tracker.other_location(name, float(loc["x"]), float(loc["y"]),
+                                               float(loc["z"]) if "z" in loc else None, now=now)
+            store = self._raids if outer_type == ZEAL_PACKET_RAID else self._groups
+            store[character] = (time.time(), members)
+        except Exception:
+            pass
+
+    def _roster(self, character: str) -> dict:
+        """
+        name → {class, level} for the character, its group and its raid. Zeal
+        only sends raid / group packets while in one, so old ones are ignored.
+        Raid classes are Zeal's class ids; the character's own is its name.
+        """
+        now = time.time()
+        roster = {}
+        for store in (self._groups, self._raids):
+            at, members = store.get(character, (0, {}))
+            if now - at <= 10:
+                roster.update(members)
+        if character in self._selves:
+            roster[character] = {**roster.get(character, {}), **self._selves[character]}
+        return roster
+
+    # ─── Combat capture ───────────────────────
+
+    def _combat_tracker(self, character: str) -> CombatTracker:
+        if character not in self._combat:
+            self._combat[character] = CombatTracker(character, self.wants_combat)
+        return self._combat[character]
+
+    def _combat_loop(self):
+        """Once a second, send each character's new combat lines as one batch."""
+        while not self._stop_event.is_set():
+            time.sleep(1)
+            for character, tracker in list(self._combat.items()):
+                try:
+                    if tracker.abbreviated and not getattr(tracker, "warned", False):
+                        tracker.warned = True
+                        self.on_log(f"[Combat] {character}: some hits are shown abbreviated or as numbers "
+                                    "only, so they can't be counted for the damage parser. Set the game's "
+                                    "hit display options back to full messages to include them.")
+                    batch = tracker.drain()
+                    if batch:
+                        self._send_combat_batch(character, batch)
+                except Exception as e:
+                    self.on_log(f"[Combat] Batch error for {character}: {e}")
+
+    def _send_combat_batch(self, character: str, batch: dict):
+        st = self._zone_state(character)
+        batch.update({
+            "pet":      self._pets.get(character, ""),
+            "zone":     st.zone,
+            "zone_id":  st.zone_id,
+            "pvp":      st.zone_pvp,
+            "entry":    st.entry,
+            "instance": st.hint,
+        })
+        roster = self._roster(character)
+        if self._roster_sent.get(character) != (batch["fight_start"], roster):
+            batch["roster"] = roster
+            self._roster_sent[character] = (batch["fight_start"], roster)
+        n = len(batch["lines"])
+        summary = (f"{n} combat lines, {sum(m['count'] for m in batch['misses'])} misses"
+                   f" ({', '.join(batch['watched']) or 'no boss'})"
+                   + (" — fight over" if batch["ended"] else ""))
+        with self._combat_lock:
+            path = self._combat_path
+            if path:
+                try:
+                    with open(path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({"character": character, **batch},
+                                           ensure_ascii=False) + "\n")
+                except Exception as e:
+                    self.on_log(f"[Combat] Could not write {path}: {e}")
+        if self._send_combat:
+            self.on_message(character, MSG_TYPE_COMBAT, summary, False, batch)
+        elif path:
+            self.on_log(f"[Combat] {character}: {summary} (dry run only)")
+
     # ─── Chat handling ────────────────────────
 
     def _handle_chat(self, character: str, data: dict):
         zeal_type = data.get("type", -1)
         text      = data.get("text", "")
+
+        if character and (self._send_combat or self._combat_path):
+            self._combat_tracker(character).feed(text, now=getattr(self._read, "read_at", None),
+                                                 chat_type=zeal_type)
 
         # Logging out (chat type not yet confirmed): the next login isn't a
         # trip from this spot

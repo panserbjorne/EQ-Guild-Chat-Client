@@ -17,7 +17,7 @@ import pystray
 
 import icon_manager
 from config import (
-    APP_NAME, APP_VERSION, CAPTURE_FILE,
+    APP_NAME, APP_VERSION, CAPTURE_FILE, COMBAT_FILE, MSG_TYPE_COMBAT,
     SRV_KEY_CLIENTS, SRV_KEY_ACTIVE_SOURCE, SRV_KEY_VERSION,
 )
 from ws_client import WSClient
@@ -74,10 +74,14 @@ class App:
             on_pipe_activity  = self._on_pipe_activity,
             eq_dir            = self.config.eq_dir,
             wants_kill        = lambda mob: self.ws.wants_kill(mob),
+            wants_combat      = lambda mob: self.ws.wants_combat(mob),
+            send_combat       = self.config.send_combat,
         )
 
         if self.config.capture_packets:
             self.pipe_reader.set_capture(CAPTURE_FILE)
+        if self.config.combat_dry_run:
+            self.pipe_reader.set_combat_file(COMBAT_FILE)
 
         # WS is not started here — it starts when a character is detected
         self.pipe_reader.start()
@@ -373,17 +377,33 @@ class App:
             text=f"Write every Zeal packet to {CAPTURE_FILE}",
         )
         chk_capture.grid(row=7, column=1, sticky="w", padx=(0, 10), pady=8)
-        self._advanced_widgets = [lbl_key, self._ent_apikey, lbl_capture, chk_capture]
+
+        # Boss fight damage for the website's damage parser
+        lbl_combat = ttk.Label(f, text="Boss fight damage:", anchor="e")
+        lbl_combat.grid(row=8, column=0, sticky="ne", padx=(10, 4), pady=8)
+        combat_row = ttk.Frame(f)
+        combat_row.grid(row=8, column=1, sticky="w", padx=(0, 10), pady=8)
+        self._var_send_combat = tk.BooleanVar(value=self.config.send_combat)
+        ttk.Checkbutton(combat_row, variable=self._var_send_combat,
+                        text="Send damage from boss fights to the server").grid(
+            row=0, column=0, sticky="w")
+        self._var_combat_dry_run = tk.BooleanVar(value=self.config.combat_dry_run)
+        ttk.Checkbutton(combat_row, variable=self._var_combat_dry_run,
+                        text=f"Also write it to {COMBAT_FILE}").grid(
+            row=1, column=0, sticky="w", pady=(4, 0))
+        self._advanced_widgets = [lbl_key, self._ent_apikey, lbl_capture, chk_capture,
+                                  lbl_combat, combat_row]
 
         # Open already if something in it is in use
         using_key = bool(self.config.api_key) and not self.config.signed_in_as
-        self._show_advanced(using_key or self.config.capture_packets)
+        self._show_advanced(using_key or self.config.capture_packets
+                            or self.config.combat_dry_run)
 
         self._signin = None
         self._refresh_account()
 
         ttk.Button(f, text="Save Settings", command=self._save_settings).grid(
-            row=8, column=0, columnspan=2, pady=12
+            row=9, column=0, columnspan=2, pady=12
         )
 
     def _show_advanced(self, show: bool):
@@ -601,7 +621,10 @@ class App:
             self._log(f"[Filter] Blocked (not whitelisted): {character}")
             return
 
-        self.ws.send(msg_type, text, is_sender=is_sender, extra=extra)
+        # Combat batches come once a second during a boss fight; the server's
+        # ack for each isn't worth a warning when it's slow
+        self.ws.send(msg_type, text, is_sender=is_sender, extra=extra,
+                     track_ack=msg_type != MSG_TYPE_COMBAT)
 
     # ─── New character dialog ─────────────────
 
@@ -690,6 +713,14 @@ class App:
         if capture != self.config.capture_packets:
             self.pipe_reader.set_capture(CAPTURE_FILE if capture else None)
         self.config.capture_packets = capture
+        send_combat = self._var_send_combat.get()
+        if send_combat != self.config.send_combat:
+            self.pipe_reader.set_send_combat(send_combat)
+        self.config.send_combat = send_combat
+        dry_run = self._var_combat_dry_run.get()
+        if dry_run != self.config.combat_dry_run:
+            self.pipe_reader.set_combat_file(COMBAT_FILE if dry_run else None)
+        self.config.combat_dry_run = dry_run
         self.config.save()
         self._log("[Config] Settings saved.")
         self._refresh_account()
