@@ -16,6 +16,7 @@ from PIL import Image
 import pystray
 
 import icon_manager
+import updater
 from config import (
     APP_NAME, APP_VERSION, CAPTURE_FILE, COMBAT_FILE, MSG_TYPE_COMBAT,
     SRV_KEY_CLIENTS, SRV_KEY_ACTIVE_SOURCE, SRV_KEY_VERSION,
@@ -46,6 +47,7 @@ class App:
         self.active_source: str     = ""
         self.server_version: str    = ""
         self.ws_status: str         = "Idle"
+        self._updating: bool        = False   # an update download is running
 
         # Character classification state
         self._ignored_chars:       set[str] = set()
@@ -250,6 +252,11 @@ class App:
             lbl = ttk.Label(f, text="—", anchor="w")
             lbl.grid(row=row, column=1, sticky="w", padx=(0, 10), pady=3)
             setattr(self, attr, lbl)
+
+        # Shown on the Version row only while the server reports a newer client
+        self._btn_update = ttk.Button(f, command=self._start_update)
+        self._btn_update.grid(row=4, column=1, sticky="e", padx=(0, 10))
+        self._btn_update.grid_remove()
 
         ttk.Label(f, text="Log:").grid(
             row=len(labels), column=0, sticky="ne", padx=(10, 4), pady=(6, 0)
@@ -521,6 +528,7 @@ class App:
                     text=f"{APP_VERSION} (server: {self.server_version})",
                     foreground=self.ERR,
                 )
+        self._refresh_update_button()
 
         # Keep tray tooltip and icon current
         if self._tray_icon:
@@ -548,6 +556,64 @@ class App:
             self.active_source = str(data[SRV_KEY_ACTIVE_SOURCE])
         if SRV_KEY_VERSION in data:
             self.server_version = str(data[SRV_KEY_VERSION])
+
+    # ─── Self-update ──────────────────────────
+
+    def _refresh_update_button(self):
+        if self._updating:
+            return
+        if updater.is_newer(self.server_version):
+            self._btn_update.config(text=f"Update to {self.server_version}")
+            self._btn_update.grid()
+        else:
+            self._btn_update.grid_remove()
+
+    def _start_update(self):
+        version = self.server_version
+        if not updater.can_self_update():
+            # Running from source: nothing to swap, so show the release instead
+            webbrowser.open(updater.RELEASES_URL)
+            return
+        self._updating = True
+        self._btn_update.config(text="Downloading…", state="disabled")
+        self._log(f"[Update] Downloading version {version}")
+
+        def progress(text: str):
+            self._schedule(lambda: self._btn_update.config(text=text))
+
+        def run():
+            try:
+                new_exe = updater.download(version, progress)
+            except Exception as exc:
+                self._schedule(lambda: self._update_failed(str(exc)))
+                return
+            self._schedule(lambda: self._finish_update(new_exe, version))
+
+        threading.Thread(target=run, daemon=True, name="update").start()
+
+    def _finish_update(self, new_exe: str, version: str):
+        self._log(f"[Update] Restarting into version {version}")
+        stopped = False
+
+        def stop():
+            nonlocal stopped
+            stopped = True
+            self.shutdown()
+
+        try:
+            updater.apply_and_restart(new_exe, before_launch=stop)
+        except Exception as exc:
+            self._update_failed(f"couldn't replace the client: {exc}")
+            if stopped:
+                self._log("[Update] Close and reopen the client to keep going")
+            return
+        self.root.destroy()
+
+    def _update_failed(self, reason: str):
+        self._updating = False
+        self._log(f"[Update] Failed: {reason}")
+        self._set_status("Update failed, see log")
+        self._btn_update.config(state="normal")
 
     def _on_fatal(self, reason: str):
         """Called by WSClient when the server permanently rejects this client."""
