@@ -13,7 +13,7 @@ import yaml
 # ─────────────────────────────────────────────
 
 APP_NAME    = "EQ Guild Chat Client"
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.6.0"
 CONFIG_FILE = "config.yaml"
 CAPTURE_FILE = "packet_capture.log"   # written when packet capture is enabled
 ZONE_STATE_FILE = "zone_state.json"   # each character's last zone copy, kept across logins
