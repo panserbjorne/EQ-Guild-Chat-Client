@@ -47,6 +47,12 @@ character:
                                  sent as "entry"; the server checks it against
                                  the guild-instance books to tell the Normal,
                                  PvP and Guild copies of a zone apart
+  zoning back into the same zone → evac, succor, gate to a bind in the
+                                 same zone and so on keep you in the same
+                                 copy, so the first entry, hint and PvP
+                                 flag are kept; the new departure spot is
+                                 sent as "reload" so the server can still
+                                 spot a book leading back into this zone
   merchant / horse refusals    → "instance" hint: only shown inside a guild
                                  or PvP copy
   camp / log back in           → you return to the same copy, so each
@@ -153,6 +159,8 @@ class ZoneState:
     zone_pvp: Optional[bool] = None   # PvP flag when the current zone was entered
     loc:      Optional[tuple] = None  # last (x, y) from player packets
     entry:    Optional[dict] = None   # {zone_id, x, y} the player zoned from
+    reload:   Optional[dict] = None   # {zone_id, x, y} of a later trip back into the same zone
+    departure: Optional[dict] = None  # where the trip in progress left from
     hint:     str            = ""     # "instance" / "pvp" from in-zone refusals
     login:    bool           = True   # next zone entry is a login, not a trip
     camped:   bool           = False  # camp message seen; logging out
@@ -654,26 +662,36 @@ class ZealPipeReader(threading.Thread):
         copy) or an ordinary route (normal zone).
         """
         st = self._zone_state(character)
-        st.entry = ({"zone_id": st.zone_id, "x": st.loc[0], "y": st.loc[1]}
-                    if st.zone_id is not None and st.loc and not st.login else None)
-        st.hint = ""
-        st.loc  = None
+        st.departure = ({"zone_id": st.zone_id, "x": st.loc[0], "y": st.loc[1]}
+                        if st.zone_id is not None and st.loc and not st.login else None)
+        st.loc = None
 
     def _handle_zone_enter(self, character: str, zone: str):
         st = self._zone_state(character)
+        if not st.login and st.zone and st.zone.lower() == zone.lower():
+            # Back into the zone we left (evac, succor, gate to a bind here...):
+            # still the same copy, so keep how we first got in. The server
+            # checks the new departure in case it was a book into this zone.
+            st.reload = st.departure
+        else:
+            st.entry, st.reload, st.hint = st.departure, None, ""
+            st.zone_pvp = st.pvp_flag
+        st.departure = None
         st.zone     = zone
         st.zone_id  = None   # stale until the next player packet
-        st.zone_pvp = st.pvp_flag
         saved = self._saved_zones.get(character)
         if st.login and saved and saved.get("zone", "").lower() == zone.lower():
             # Logging back in puts you in the copy you camped in
             st.entry, st.hint, st.zone_pvp = saved.get("entry"), saved.get("hint", ""), saved.get("pvp")
+            st.reload = saved.get("reload")
             self.on_log(f"[Zone] {character} logged back into the same copy of {zone}")
         st.login = st.camped = False
         self._save_zone(character)
         pvp = {True: "PvP flag on", False: "PvP flag off", None: "PvP flag unknown"}[st.zone_pvp]
         came = (f"from {st.entry['x']:.0f}, {st.entry['y']:.0f} in zone {st.entry['zone_id']}"
                 if st.entry else "departure unknown")
+        if st.reload:
+            came += f"; back in from {st.reload['x']:.0f}, {st.reload['y']:.0f} in the same zone"
         # The server decides Normal / PvP / Guild from this (see zone_versions.py)
         self.on_log(f"[Zone] {character} entered {zone} ({pvp}; {came})")
         # Temporary: the server logs which copy it thinks this is, and why
@@ -681,6 +699,7 @@ class ZealPipeReader(threading.Thread):
             "zone":     zone,
             "pvp":      st.zone_pvp,
             "entry":    st.entry,
+            "reload":   st.reload,
             "instance": st.hint,
         })
 
@@ -698,7 +717,8 @@ class ZealPipeReader(threading.Thread):
         if st is None or not st.zone:
             return
         self._saved_zones[character] = {
-            "zone": st.zone, "entry": st.entry, "hint": st.hint, "pvp": st.zone_pvp,
+            "zone": st.zone, "entry": st.entry, "reload": st.reload, "hint": st.hint,
+            "pvp": st.zone_pvp,
         }
         try:
             with open(ZONE_STATE_FILE, "w", encoding="utf-8") as f:
@@ -729,6 +749,7 @@ class ZealPipeReader(threading.Thread):
                 and saved.get("zone", "").lower() == st.zone.lower()):
             # Client started mid-zone: assume the copy this character was last in
             st.entry, st.hint = saved.get("entry"), saved.get("hint", "")
+            st.reload = saved.get("reload")
             if st.zone_pvp is None:
                 st.zone_pvp = saved.get("pvp")
         self.on_message(character, MSG_TYPE_KILL, text, False, {
@@ -738,6 +759,7 @@ class ZealPipeReader(threading.Thread):
             "zone_id": st.zone_id,
             "pvp":     st.zone_pvp,
             "entry":   st.entry,
+            "reload":  st.reload,
             "instance": st.hint,
         })
 
@@ -812,6 +834,7 @@ class ZealPipeReader(threading.Thread):
             "zone_id":  st.zone_id,
             "pvp":      st.zone_pvp,
             "entry":    st.entry,
+            "reload":   st.reload,
             "instance": st.hint,
         })
         roster = self._roster(character)
