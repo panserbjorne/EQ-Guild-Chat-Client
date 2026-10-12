@@ -79,9 +79,17 @@ COMBAT_FILE as one JSON object per line (the dry run). The first batch of a
 fight, and any batch after the roster changes, also carries the classes and
 levels of the character, its group and its raid (raid / group packets).
 
+When a character's melee hits come through shortened (the game's hit
+display options set to Abbreviated or Number Only), its EQ log is followed
+from then on and the full hit lines are taken from there (needs /log on).
+The log is checked for new lines each time a pipe line arrives, so a hit
+gets the time it was read rather than the log's whole-second stamp.
+
 When the client starts after the character zoned or toggled PvP, the
 zone and PvP state are read back from the character's EQ log file
-(eq_log.py), which needs logging on in game (/log on). Live lines always
+(eq_log.py), which needs logging on in game (/log on). The log is looked
+for in the folder of the game process behind the pipe first, then in the
+EverQuest folder from Settings. Live lines always
 win over the log. A PvP toggle seen in an earlier session is kept in
 ZONE_STATE_FILE, and the newer of that and the log's last toggle is used;
 with neither, the flag is assumed off.
@@ -231,9 +239,12 @@ class ZealPipeReader(threading.Thread):
         self._state       = ZealState()
         self._state_lock  = threading.Lock()
         self._zones: dict[str, ZoneState] = {}   # character → zone state
-        self._eq_dir = eq_dir                    # EQ folder; "" = find it from the pipe
+        self._eq_dir = eq_dir                    # EQ folder if the pipe's game can't be found; "" = none
         self._char_pipes: dict[str, str] = {}    # character → Zeal pipe path
         self._log_checked: dict[str, float] = {} # character → last EQ log read
+        self._log_tails: dict[str, eq_log.LogTail] = {}  # character → its log, for shortened hits
+        self._tail_checked: dict[str, float] = {}        # character → last look for that log
+        self._tail_lock = threading.Lock()
         self._saved_zones = self._load_saved_zones()  # character → last copy entered
         self._capture_path: Optional[str] = None
         self._capture_lock = threading.Lock()
@@ -248,6 +259,7 @@ class ZealPipeReader(threading.Thread):
         """Change the EQ folder used to find log files; re-read logs on next use."""
         self._eq_dir = eq_dir
         self._log_checked.clear()
+        self._tail_checked.clear()
 
     def set_capture(self, path: Optional[str]):
         """Start writing every packet to `path`, or stop if None."""
@@ -322,6 +334,7 @@ class ZealPipeReader(threading.Thread):
                 self._zones.pop(character, None)
                 self._char_pipes.pop(character, None)
                 self._log_checked.pop(character, None)
+                self._stop_log_tail(character)
         self.on_log(f"[Pipe] Disconnected from {pipe_path}")
 
     # ─── Reader thread ────────────────────────
@@ -628,15 +641,8 @@ class ZealPipeReader(threading.Thread):
             return
         self._log_checked[character] = now
 
-        eq_dir = self._eq_dir or eq_log.eq_dir_for_pipe(self._char_pipes.get(character, ""))
-        if not eq_dir:
-            self.on_log(f"[Zone] EQ folder unknown for {character} (pipe "
-                        f"{self._char_pipes.get(character, '?')}); set it in Settings")
-            return
-        path = eq_log.find_log(eq_dir, character)
+        path = self._find_log(character, "[Zone]")
         if not path:
-            self.on_log(f"[Zone] No eqlog_{character}_*.txt in {eq_dir} "
-                        "or its Logs folder; is /log on?")
             return
         zone, zone_pvp, pvp_flag, pvp_flag_at = eq_log.read_zone_state(path)
 
@@ -652,6 +658,28 @@ class ZealPipeReader(threading.Thread):
             st.zone_pvp = zone_pvp
         pvp = {True: "PvP flag on", False: "PvP flag off", None: "PvP flag unknown"}[st.zone_pvp]
         self.on_log(f"[Zone] {character} from EQ log: {st.zone or 'zone unknown'} ({pvp})")
+
+    def _find_log(self, character: str, tag: str = "") -> Optional[str]:
+        """
+        The character's EQ log: in the folder of the game behind its pipe, or
+        failing that the EverQuest folder from Settings. Says why when there's
+        none, with `tag` ("" = quietly).
+        """
+        dirs = [d for d in (eq_log.eq_dir_for_pipe(self._char_pipes.get(character, "")),
+                            self._eq_dir) if d]
+        for eq_dir in dict.fromkeys(os.path.normcase(os.path.normpath(d)) for d in dirs):
+            path = eq_log.find_log(eq_dir, character)
+            if path:
+                return path
+        if not tag:
+            pass
+        elif not dirs:
+            self.on_log(f"{tag} EQ folder unknown for {character} (pipe "
+                        f"{self._char_pipes.get(character, '?')}); set it under Advanced")
+        else:
+            self.on_log(f"{tag} No eqlog_{character}_*.txt in {' or '.join(dirs)} "
+                        "or its Logs folder; is /log on?")
+        return None
 
     def _handle_player(self, character: str, data_raw):
         """Pick up the numeric zone id from a player packet."""
@@ -847,17 +875,71 @@ class ZealPipeReader(threading.Thread):
             self._combat[character] = CombatTracker(character, self.wants_combat)
         return self._combat[character]
 
+    def _pump_log(self, character: str, now: float):
+        """
+        Feed a character's new EQ log lines to its combat tracker once its hits
+        show up shortened, finding the log first (every 30s until there is one).
+        Each line gets `now`, the time it was read, kept within the second the
+        log stamped it with.
+        """
+        tracker = self._combat.get(character)
+        if tracker is None or not (tracker.abbreviated or tracker.hits_from_log):
+            return
+        tail = self._log_tails.get(character)
+        if tail is None:
+            with self._tail_lock:
+                tail = self._log_tails.get(character)
+                if tail is None:
+                    if time.time() - self._tail_checked.get(character, 0) < 30:
+                        return
+                    self._tail_checked[character] = time.time()
+                    tail = self._start_log_tail(character, tracker)
+                    if tail is None:
+                        return
+        for stamp, text in tail.read():
+            when = min(max(now, stamp), stamp + 0.99) if stamp else now
+            tracker.feed_log(text, when)
+
+    def _start_log_tail(self, character: str, tracker: CombatTracker) -> Optional[eq_log.LogTail]:
+        warned = getattr(tracker, "warned", False)
+        path = self._find_log(character, "" if warned else "[Combat]")
+        if not path:
+            if not warned:
+                tracker.warned = True
+                self.on_log(f"[Combat] {character}: some hits are shown abbreviated or as numbers "
+                            "only, so they can't be counted for the damage parser. Turn on logging "
+                            "in game (/log on) to have them read from the EQ log instead, or set "
+                            "the game's hit display options back to full messages.")
+            return None
+        try:
+            tail = eq_log.LogTail(path)
+        except OSError as e:
+            self.on_log(f"[Combat] Could not open {path}: {e}")
+            return None
+        self._log_tails[character] = tail
+        tracker.hits_from_log = True
+        self.on_log(f"[Combat] {character}: hits are shown abbreviated or as numbers only, "
+                    f"so melee hits are read from {path} instead")
+        return tail
+
+    def _stop_log_tail(self, character: str):
+        """The character's game closed: stop following its log until hits show shortened again."""
+        with self._tail_lock:
+            tail = self._log_tails.pop(character, None)
+            self._tail_checked.pop(character, None)
+        if tail:
+            tail.close()
+        tracker = self._combat.get(character)
+        if tracker:
+            tracker.hits_from_log, tracker.abbreviated, tracker.warned = False, 0, False
+
     def _combat_loop(self):
         """Once a second, send each character's new combat lines as one batch."""
         while not self._stop_event.is_set():
             time.sleep(1)
             for character, tracker in list(self._combat.items()):
                 try:
-                    if tracker.abbreviated and not getattr(tracker, "warned", False):
-                        tracker.warned = True
-                        self.on_log(f"[Combat] {character}: some hits are shown abbreviated or as numbers "
-                                    "only, so they can't be counted for the damage parser. Set the game's "
-                                    "hit display options back to full messages to include them.")
+                    self._pump_log(character, time.time())
                     batch = tracker.drain()
                     if batch:
                         self._send_combat_batch(character, batch)
@@ -904,8 +986,9 @@ class ZealPipeReader(threading.Thread):
         text      = data.get("text", "")
 
         if character and (self._send_combat or self._combat_path):
-            self._combat_tracker(character).feed(text, now=getattr(self._read, "read_at", None),
-                                                 chat_type=zeal_type)
+            now = getattr(self._read, "read_at", None) or time.time()
+            self._pump_log(character, now)   # hits logged before this line come first
+            self._combat_tracker(character).feed(text, now=now, chat_type=zeal_type)
 
         # Logging out (chat type not yet confirmed): the next login isn't a
         # trip from this spot

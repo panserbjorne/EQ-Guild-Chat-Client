@@ -59,6 +59,11 @@ more: [[ts, x, y, z], ...], and others' positions the same way: other_locs
 packets) and watched mobs we target (the player packet's target_loc, only
 sent while it's close). Zeal's x and y are the game's y and x, as in /loc.
 
+Melee hits shortened by the game's hit display options ("slash a gnoll for
+123", or just "123") can't be read, so once one shows up the reader switches
+the tracker to hits_from_log: the pipe's hit lines are dropped and the full
+ones come from the character's EQ log through feed_log() instead.
+
 Sourceless non-melee lines are ours: the server only sends that text to the
 caster or damage shield owner (everyone else gets "Bob hit X for N points of
 non-melee damage."). Each one carries self_spells, the spells we cast in the
@@ -131,7 +136,9 @@ _AVOID = (("invulnerable", "invulnerable"), ("absorbs the blow", "rune"), ("parr
           ("dodge", "dodge"), ("ripost", "riposte"), ("block", "block"))
 
 # A hit shown abbreviated ("backstab a gnoll for 123") or as a bare number, from
-# the game's "hits" display options; the server can't read these
+# the game's "hits" display options; the server can't read these, so once one
+# shows up the hits are taken from the EQ log instead (hits_from_log), which
+# always gets the full line
 RE_ABBREVIATED = re.compile(r"^(?:\d+|.+ for \d+)$")
 
 # Cheap test before the regexes: nearly every chat line fails this
@@ -177,20 +184,37 @@ class CombatTracker:
         self._others: dict = {}            # name → (x, y): where a raid member or boss was last sent from
         self._others_out: list = []        # [ts, name, x, y, z] waiting for the next batch
         self.abbreviated = 0               # abbreviated hit lines seen (see RE_ABBREVIATED)
+        self.hits_from_log = False         # melee hits come from feed_log(), not the pipe
 
     # ─── Input ────────────────────────────────
 
     def feed(self, text: str, now: Optional[float] = None, chat_type: Optional[int] = None):
         """Classify one chat line (with its Zeal chat type, if known) and keep it if it's combat."""
-        if chat_type in HIT_TYPES and RE_ABBREVIATED.match(text) and not text.endswith(" damage."):
-            self.abbreviated += 1
-            return
+        if chat_type in HIT_TYPES:
+            if self.hits_from_log:
+                return   # feed_log() has the full line
+            if RE_ABBREVIATED.match(text) and not text.endswith(" damage."):
+                self.abbreviated += 1
+                return
         if not _MAYBE.search(text) and not self._sourceless and not self._from_boss(text):
             return
         now = now or time.time()
         with self._lock:
             self._check_lull(now)
             self._classify(text, now, chat_type)
+
+    def feed_log(self, text: str, now: float):
+        """
+        One line from the character's EQ log, while hits_from_log is on: only
+        melee hits are used (everything else still comes from the pipe), and
+        not ones on us, which the game never shortens.
+        """
+        m = RE_HIT.match(text)
+        if not m or m.group("tgt") == "YOU" or RE_SOURCELESS.match(text) or RE_NONMELEE.match(text):
+            return
+        with self._lock:
+            self._check_lull(now)
+            self._classify(text, now)
 
     def casting(self, spell: str, now: Optional[float] = None, target: str = ""):
         """

@@ -8,11 +8,16 @@ Logs folder on newer clients) when logging is on
 (/log on), so the latest "You have entered X." and PvP toggle lines can be
 read back from the end of that file.
 
-The EQ folder comes from app.eq_dir in config.yaml, or failing that from the
-EverQuest process that owns the Zeal pipe (pipe name zeal_<pid>).
+LogTail follows a log as it grows, for the melee hits Zeal's pipe only shows
+shortened when the game's hit display options are set to Abbreviated or
+Number Only (the log always gets the full line).
+
+The EQ folder is the one of the EverQuest process that owns the Zeal pipe
+(pipe name zeal_<pid>), or failing that app.eq_dir in config.yaml.
 """
 
 import glob
+import threading
 import os
 import re
 import time
@@ -115,3 +120,46 @@ def read_zone_state(path: str) -> tuple[str, Optional[bool], Optional[bool], flo
     except OSError:
         pass
     return zone, zone_pvp, pvp_flag, pvp_flag_at
+
+
+class LogTail:
+    """
+    New lines of a log file from the moment it's opened. Thread safe; read()
+    returns (logged at, text) for each complete line written since the last
+    call, with the "[Sun Oct 11 22:48:06 2026] " prefix taken off the text.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        self._f = open(path, "rb")
+        self._f.seek(0, os.SEEK_END)
+        self._partial = b""
+
+    def read(self) -> list[tuple[float, str]]:
+        with self._lock:
+            if self._f is None:
+                return []
+            try:
+                if os.fstat(self._f.fileno()).st_size < self._f.tell():
+                    self._f.seek(0)   # cleared or replaced: start over
+                    self._partial = b""
+                data = self._f.read()
+            except (OSError, ValueError):
+                return []
+            if not data:
+                return []
+            lines = (self._partial + data).split(b"\n")
+            self._partial = lines.pop()   # not finished yet
+        out = []
+        for raw in lines:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line:
+                out.append((_line_time(line), _RE_LOG_PREFIX.sub("", line)))
+        return out
+
+    def close(self):
+        with self._lock:
+            if self._f is not None:
+                self._f.close()
+                self._f = None

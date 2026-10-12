@@ -306,27 +306,12 @@ class App:
             row=2, column=1, sticky="w", padx=(0, 10), pady=8
         )
 
-        # EverQuest folder, for reading zone / PvP state back from the EQ log
-        ttk.Label(f, text="EverQuest folder:", anchor="e").grid(
-            row=3, column=0, sticky="e", padx=(10, 4), pady=8
-        )
-        eq_row = ttk.Frame(f)
-        eq_row.grid(row=3, column=1, sticky="ew", padx=(0, 10), pady=8)
-        eq_row.columnconfigure(0, weight=1)
-        self._ent_eq_dir = ttk.Entry(eq_row)
-        self._ent_eq_dir.insert(0, self.config.eq_dir)
-        self._ent_eq_dir.grid(row=0, column=0, sticky="ew")
-        self._ent_eq_dir.bind("<KeyRelease>", lambda e: self._refresh_attention())
-        ttk.Button(eq_row, text="Browse…", command=self._browse_eqgame).grid(
-            row=0, column=1, padx=(6, 0)
-        )
-
         # Whitelist / Blacklist
         list_frame = ttk.Frame(f)
-        list_frame.grid(row=4, column=0, columnspan=2, sticky="nsew", padx=10, pady=4)
+        list_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=10, pady=4)
         list_frame.columnconfigure(0, weight=1)
         list_frame.columnconfigure(1, weight=1)
-        f.rowconfigure(4, weight=1)
+        f.rowconfigure(3, weight=1)
 
         for col, (title, attr_box, is_white) in enumerate([
             ("Whitelisted Characters", "_wl_box", True),
@@ -362,7 +347,7 @@ class App:
 
         # Advanced: settings most people never need, hidden until asked for
         adv_head = ttk.Frame(f, cursor="hand2")
-        adv_head.grid(row=5, column=0, columnspan=2, sticky="ew", padx=10, pady=(10, 0))
+        adv_head.grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=(10, 0))
         adv_head.columnconfigure(1, weight=1)
         self._lbl_advanced = ttk.Label(adv_head, foreground=self.ACC, cursor="hand2",
                                        font=("Segoe UI", 10, "bold"))
@@ -370,6 +355,22 @@ class App:
         ttk.Separator(adv_head).grid(row=0, column=1, sticky="ew", padx=(8, 0))
         for w in (adv_head, self._lbl_advanced):
             w.bind("<Button-1>", lambda e: self._toggle_advanced())
+
+        # EverQuest folder, for reading the EQ log (zone / PvP state, shortened
+        # hits); only needed when the folder of the game behind the Zeal pipe
+        # can't be found
+        lbl_eq_dir = ttk.Label(f, text="EverQuest folder:", anchor="e")
+        lbl_eq_dir.grid(row=5, column=0, sticky="e", padx=(10, 4), pady=8)
+        eq_row = ttk.Frame(f)
+        eq_row.grid(row=5, column=1, sticky="ew", padx=(0, 10), pady=8)
+        eq_row.columnconfigure(0, weight=1)
+        self._ent_eq_dir = ttk.Entry(eq_row)
+        self._ent_eq_dir.insert(0, self.config.eq_dir)
+        self._ent_eq_dir.grid(row=0, column=0, sticky="ew")
+        self._ent_eq_dir.bind("<KeyRelease>", lambda e: self._refresh_attention())
+        ttk.Button(eq_row, text="Browse…", command=self._browse_eqgame).grid(
+            row=0, column=1, padx=(6, 0)
+        )
 
         # Older servers, or anyone who'd rather paste a key from the setup page
         lbl_key = ttk.Label(f, text="API Key:", anchor="e")
@@ -401,13 +402,13 @@ class App:
         ttk.Checkbutton(combat_row, variable=self._var_combat_dry_run,
                         text=f"Also write it to {COMBAT_FILE}").grid(
             row=1, column=0, sticky="w", pady=(4, 0))
-        self._advanced_widgets = [lbl_key, self._ent_apikey, lbl_capture, chk_capture,
+        self._advanced_widgets = [lbl_eq_dir, eq_row, lbl_key, self._ent_apikey, lbl_capture, chk_capture,
                                   lbl_combat, combat_row]
 
         # Open already if something in it is in use
         using_key = bool(self.config.api_key) and not self.config.signed_in_as
         self._show_advanced(using_key or self.config.capture_packets
-                            or self.config.combat_dry_run)
+                            or self.config.combat_dry_run or bool(self.config.eq_dir))
 
         self._signin = None
         self._refresh_account()
@@ -844,14 +845,17 @@ class App:
         self._refresh_attention()
 
     def _refresh_attention(self):
-        """Highlight the settings that are still at their default or not set up."""
+        """
+        Highlight the settings that are still at their default or not set up,
+        and an EverQuest folder that's filled in but has no eqgame.exe.
+        """
         server = self._ent_server.get().strip()
         eq_dir = self._ent_eq_dir.get().strip().strip('"')
         if eq_dir.lower().endswith(".exe"):
             eq_dir = os.path.dirname(eq_dir)
         needs = {
             self._ent_server: not server or server == DEFAULT_SERVER_ADDRESS,
-            self._ent_eq_dir: not eq_dir or not os.path.isfile(os.path.join(eq_dir, "eqgame.exe")),
+            self._ent_eq_dir: bool(eq_dir) and not os.path.isfile(os.path.join(eq_dir, "eqgame.exe")),
         }
         for entry, attention in needs.items():
             entry.config(style="Attention.TEntry" if attention else "TEntry")
@@ -967,4 +971,4 @@ class App:
         if name in lst:
             lst.remove(name)
             self.config.save()
-            self._refresh_char_lists()
+            self._refresh_char_lists()
