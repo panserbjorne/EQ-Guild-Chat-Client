@@ -62,6 +62,10 @@ character:
                                  character's zone, entry, hint and PvP flag
                                  are saved to ZONE_STATE_FILE and restored
                                  when they log back into that zone
+  PvP flag                     → kept per character in ZONE_STATE_FILE with
+                                 when it was last toggled, since it stays set
+                                 across logins; a newer toggle in the EQ log
+                                 wins, and with neither it's assumed off
 
 Combat capture
 --------------
@@ -78,8 +82,9 @@ levels of the character, its group and its raid (raid / group packets).
 When the client starts after the character zoned or toggled PvP, the
 zone and PvP state are read back from the character's EQ log file
 (eq_log.py), which needs logging on in game (/log on). Live lines always
-win over the log. If the log has nothing either, pvp is sent as None and
-the server treats the kill as non-PvP.
+win over the log. A PvP toggle seen in an earlier session is kept in
+ZONE_STATE_FILE, and the newer of that and the log's last toggle is used;
+with neither, the flag is assumed off.
 """
 
 import os
@@ -166,6 +171,7 @@ class ZoneState:
     zone:     str            = ""     # long name from "You have entered"
     zone_id:  Optional[int]  = None   # from player packets
     pvp_flag: Optional[bool] = None   # current PvP toggle; None = not seen yet
+    pvp_flag_at: float       = 0.0    # when pvp_flag was toggled (0 = assumed / unknown)
     zone_pvp: Optional[bool] = None   # PvP flag when the current zone was entered
     loc:      Optional[tuple] = None  # last (x, y) from player packets
     entry:    Optional[dict] = None   # {zone_id, x, y} the player zoned from
@@ -602,8 +608,14 @@ class ZealPipeReader(threading.Thread):
 
     def _zone_state(self, character: str) -> ZoneState:
         if character not in self._zones:
-            self._zones[character] = ZoneState()
+            st = self._zones[character] = ZoneState()
+            saved = self._saved_zones.get(character) or {}
+            if isinstance(saved.get("pvp_flag"), bool):
+                # The flag stays set across logins: start from the last one seen
+                st.pvp_flag, st.pvp_flag_at = saved["pvp_flag"], float(saved.get("pvp_flag_at") or 0)
             self._seed_from_log(character)
+            if st.pvp_flag is None:
+                st.pvp_flag = False   # never seen toggled: assume off
         return self._zones[character]
 
     def _seed_from_log(self, character: str):
@@ -626,13 +638,15 @@ class ZealPipeReader(threading.Thread):
             self.on_log(f"[Zone] No eqlog_{character}_*.txt in {eq_dir} "
                         "or its Logs folder; is /log on?")
             return
-        zone, zone_pvp, pvp_flag = eq_log.read_zone_state(path)
+        zone, zone_pvp, pvp_flag, pvp_flag_at = eq_log.read_zone_state(path)
 
         st = self._zones[character]
         if not st.zone and zone:
             st.zone = zone
-        if st.pvp_flag is None:
-            st.pvp_flag = pvp_flag
+        if pvp_flag is not None and (st.pvp_flag is None or pvp_flag_at > st.pvp_flag_at):
+            # Toggled while the client wasn't watching
+            st.pvp_flag, st.pvp_flag_at = pvp_flag, pvp_flag_at
+            self._save_zone(character)
         # The log's PvP state only applies if it's describing the same zone visit
         if st.zone_pvp is None and zone and zone.lower() == st.zone.lower():
             st.zone_pvp = zone_pvp
@@ -731,12 +745,17 @@ class ZealPipeReader(threading.Thread):
     def _save_zone(self, character: str):
         """Remember which copy of the zone this character is in, for their next login."""
         st = self._zones.get(character)
-        if st is None or not st.zone:
+        if st is None:
             return
-        self._saved_zones[character] = {
-            "zone": st.zone, "entry": st.entry, "reload": st.reload, "hint": st.hint,
-            "pvp": st.zone_pvp,
-        }
+        saved = self._saved_zones.get(character) or {}
+        if st.zone:
+            saved = {
+                "zone": st.zone, "entry": st.entry, "reload": st.reload, "hint": st.hint,
+                "pvp": st.zone_pvp,
+            }
+        if st.pvp_flag_at:   # only a seen toggle, not the assumed default
+            saved.update({"pvp_flag": st.pvp_flag, "pvp_flag_at": st.pvp_flag_at})
+        self._saved_zones[character] = saved
         try:
             with open(ZONE_STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(self._saved_zones, f, indent=1)
@@ -744,7 +763,9 @@ class ZealPipeReader(threading.Thread):
             self.on_log(f"[Zone] Could not save {ZONE_STATE_FILE}: {e}")
 
     def _handle_pvp_toggle(self, character: str, on: bool):
-        self._zone_state(character).pvp_flag = on
+        st = self._zone_state(character)
+        st.pvp_flag, st.pvp_flag_at = on, time.time()
+        self._save_zone(character)
         self.on_log(f"[PvP] {character} PvP {'ON' if on else 'OFF'} (applies from next zone)")
 
     def _handle_kill(self, character: str, text: str):

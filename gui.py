@@ -18,7 +18,7 @@ import pystray
 import icon_manager
 import updater
 from config import (
-    APP_NAME, APP_VERSION, CAPTURE_FILE, COMBAT_FILE, MSG_TYPE_COMBAT,
+    APP_NAME, APP_VERSION, CAPTURE_FILE, COMBAT_FILE, MSG_TYPE_COMBAT, DEFAULT_SERVER_ADDRESS,
     SRV_KEY_CLIENTS, SRV_KEY_ACTIVE_SOURCE, SRV_KEY_VERSION,
 )
 from ws_client import WSClient
@@ -36,6 +36,7 @@ class App:
     ACC   = "#4e9ef7"
     PANEL = "#23272f"
     ERR   = "#e05c5c"
+    WARN  = "#e0a040"   # settings that still need filling in
 
     def __init__(self, root: tk.Tk, config):
         self.root   = root
@@ -280,6 +281,7 @@ class App:
         self._ent_server = ttk.Entry(f)
         self._ent_server.insert(0, self.config.server_address)
         self._ent_server.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=8)
+        self._ent_server.bind("<KeyRelease>", lambda e: self._refresh_attention())
 
         # Discord sign-in: the server gives this PC its own token
         ttk.Label(f, text="Account:", anchor="e").grid(
@@ -314,6 +316,7 @@ class App:
         self._ent_eq_dir = ttk.Entry(eq_row)
         self._ent_eq_dir.insert(0, self.config.eq_dir)
         self._ent_eq_dir.grid(row=0, column=0, sticky="ew")
+        self._ent_eq_dir.bind("<KeyRelease>", lambda e: self._refresh_attention())
         ttk.Button(eq_row, text="Browse…", command=self._browse_eqgame).grid(
             row=0, column=1, padx=(6, 0)
         )
@@ -470,6 +473,15 @@ class App:
                                              insertcolor=fg, borderwidth=1)
         style.configure("TButton",           background=panel, foreground=fg, padding=6)
         style.map("TButton",
+            background=[("active", acc)],
+            foreground=[("active", "#fff")])
+        # Settings still at their default or not set up yet
+        style.configure("Attention.TEntry",  fieldbackground="#3a2e1a", foreground=fg,
+                                             insertcolor=fg, bordercolor=self.WARN,
+                                             lightcolor=self.WARN, darkcolor=self.WARN)
+        style.configure("Attention.TButton", background=self.WARN, foreground="#1a1d23",
+                                             padding=6, bordercolor=self.WARN)
+        style.map("Attention.TButton",
             background=[("active", acc)],
             foreground=[("active", "#fff")])
         style.configure("TScrollbar",        background=panel,
@@ -760,6 +772,7 @@ class App:
         if path:
             self._ent_eq_dir.delete(0, "end")
             self._ent_eq_dir.insert(0, os.path.normpath(os.path.dirname(path)))
+            self._refresh_attention()
 
     def _save_settings(self):
         eq_dir = self._ent_eq_dir.get().strip().strip('"')
@@ -828,6 +841,22 @@ class App:
             self._btn_signin.config(text="Sign in with Discord")
             self._btn_signout.grid_remove()
         self._ent_apikey.config(state="disabled" if self.config.signed_in_as else "normal")
+        self._refresh_attention()
+
+    def _refresh_attention(self):
+        """Highlight the settings that are still at their default or not set up."""
+        server = self._ent_server.get().strip()
+        eq_dir = self._ent_eq_dir.get().strip().strip('"')
+        if eq_dir.lower().endswith(".exe"):
+            eq_dir = os.path.dirname(eq_dir)
+        needs = {
+            self._ent_server: not server or server == DEFAULT_SERVER_ADDRESS,
+            self._ent_eq_dir: not eq_dir or not os.path.isfile(os.path.join(eq_dir, "eqgame.exe")),
+        }
+        for entry, attention in needs.items():
+            entry.config(style="Attention.TEntry" if attention else "TEntry")
+        signed_out = not (self._signin or self.config.signed_in_as or self.config.api_key)
+        self._btn_signin.config(style="Attention.TButton" if signed_out else "TButton")
 
     def _toggle_signin(self):
         if self._signin:
@@ -938,4 +967,4 @@ class App:
         if name in lst:
             lst.remove(name)
             self.config.save()
-            self._refresh_char_lists()
+            self._refresh_char_lists()

@@ -113,11 +113,14 @@ RE_TIME_INGAME = re.compile(r"^It is \d+ (?:AM|PM) on [A-Z][a-z]+, the \d+(?:st|
 # Config
 # ─────────────────────────────────────────────
 
+DEFAULT_SERVER_ADDRESS = "ws://localhost:8765"
+
+
 class Config:
     """Loads and saves application settings to config.yaml."""
 
     def __init__(self):
-        self.server_address:  str       = "ws://localhost:8765"
+        self.server_address:  str       = DEFAULT_SERVER_ADDRESS
         self.api_key:         str       = ""   # API key, or the token from signing in with Discord
         self.signed_in_as:    str       = ""   # Discord member the token belongs to; "" = API key
         self.client_id:       str       = ""
@@ -187,4 +190,4 @@ class Config:
             },
         }
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
+            yaml.dump(data, f, default_flow_style=False, allow_unicode=True)

@@ -15,11 +15,12 @@ EverQuest process that owns the Zeal pipe (pipe name zeal_<pid>).
 import glob
 import os
 import re
+import time
 from typing import Optional
 
 from config import RE_PVP_ON, RE_PVP_OFF, RE_ZONE_ENTER
 
-_RE_LOG_PREFIX = re.compile(r"^\[[^\]]*\]\s*")
+_RE_LOG_PREFIX = re.compile(r"^\[([^\]]*)\]\s*")
 _RE_PIPE_PID   = re.compile(r"zeal_(\d+)", re.IGNORECASE)
 
 # How far back from the end of the log to look
@@ -81,21 +82,31 @@ def _lines_backwards(path: str):
             yield tail.decode("utf-8", errors="replace").strip()
 
 
-def read_zone_state(path: str) -> tuple[str, Optional[bool], Optional[bool]]:
+def _line_time(line: str) -> float:
+    """Unix time of a "[Sun Oct 11 22:48:06 2026] ..." log line (local time), 0 if unreadable."""
+    m = _RE_LOG_PREFIX.match(line)
+    try:
+        return time.mktime(time.strptime(m.group(1), "%a %b %d %H:%M:%S %Y")) if m else 0.0
+    except (ValueError, OverflowError):
+        return 0.0
+
+
+def read_zone_state(path: str) -> tuple[str, Optional[bool], Optional[bool], float]:
     """
-    (zone, zone_pvp, pvp_flag) from the end of a log file:
-      zone      last "You have entered X." ("" if none)
-      zone_pvp  PvP flag at the moment that zone was entered (None if unknown)
-      pvp_flag  latest PvP toggle (None if none seen)
+    (zone, zone_pvp, pvp_flag, pvp_flag_at) from the end of a log file:
+      zone         last "You have entered X." ("" if none)
+      zone_pvp     PvP flag at the moment that zone was entered (None if unknown)
+      pvp_flag     latest PvP toggle (None if none seen)
+      pvp_flag_at  when that toggle was logged (0 if unknown)
     """
-    zone, zone_pvp, pvp_flag = "", None, None
+    zone, zone_pvp, pvp_flag, pvp_flag_at = "", None, None, 0.0
     try:
         for line in _lines_backwards(path):
             text = _RE_LOG_PREFIX.sub("", line)
             toggle = True if RE_PVP_ON.search(text) else False if RE_PVP_OFF.search(text) else None
             if toggle is not None:
                 if pvp_flag is None:
-                    pvp_flag = toggle
+                    pvp_flag, pvp_flag_at = toggle, _line_time(line)
                 if zone:
                     zone_pvp = toggle   # last toggle before the zone entry
                     break
@@ -103,4 +114,4 @@ def read_zone_state(path: str) -> tuple[str, Optional[bool], Optional[bool]]:
                 zone = m.group("zone")
     except OSError:
         pass
-    return zone, zone_pvp, pvp_flag
+    return zone, zone_pvp, pvp_flag, pvp_flag_at
