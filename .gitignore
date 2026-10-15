@@ -1,4 +1,5 @@
 config.yaml
+inventory_uploads.json
 zone_state.json
 *.exe
 

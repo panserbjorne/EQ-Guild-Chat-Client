@@ -276,6 +276,11 @@ class ZealPipeReader(threading.Thread):
     def stop(self):
         self._stop_event.set()
 
+    def eq_dirs(self) -> list[str]:
+        """The EQ folders of the games behind the open pipes, then the one from Settings."""
+        dirs = [eq_log.eq_dir_for_pipe(p) for p in list(self._active_pipes)] + [self._eq_dir]
+        return list(dict.fromkeys(os.path.normcase(os.path.normpath(d)) for d in dirs if d))
+
     def set_eq_dir(self, eq_dir: str):
         """Change the EQ folder used to find log files; re-read logs on next use."""
         self._eq_dir = eq_dir

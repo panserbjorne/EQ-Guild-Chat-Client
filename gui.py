@@ -19,11 +19,13 @@ import icon_manager
 import updater
 from config import (
     APP_NAME, APP_VERSION, CAPTURE_FILE, COMBAT_FILE, MSG_TYPE_COMBAT, DEFAULT_SERVER_ADDRESS,
+    MSG_TYPE_INVENTORY,
     SRV_KEY_CLIENTS, SRV_KEY_ACTIVE_SOURCE, SRV_KEY_VERSION,
 )
 from ws_client import WSClient
 from discord_signin import DiscordSignIn
 from pipe_reader import ZealPipeReader
+from inventory_watcher import InventoryWatcher
 
 
 
@@ -86,6 +88,15 @@ class App:
         if self.config.combat_dry_run:
             self.pipe_reader.set_combat_file(COMBAT_FILE)
 
+        # Sends new <Character>-Inventory.txt files while connected, when turned on
+        self.inventory = InventoryWatcher(
+            eq_dirs = self.pipe_reader.eq_dirs,
+            send    = self._send_inventory,
+            on_log  = self._log,
+            enabled = self.config.upload_inventory,
+        )
+        self.inventory.start()
+
         # WS is not started here — it starts when a character is detected
         self.pipe_reader.start()
         self._set_status("Waiting for game process…")
@@ -107,7 +118,16 @@ class App:
             on_server_broadcast = self._on_server_broadcast,
             on_fatal            = self._on_fatal,
             character           = self.current_character,
+            on_inventory_result = lambda data: self.inventory.on_result(data),
         )
+
+    def _send_inventory(self, filename: str, text: str, file_time: float):
+        """Queue an inventory file for the server (watcher thread); its msg_id, or None offline."""
+        if not self._ws_connected:
+            return None
+        return self.ws.send(MSG_TYPE_INVENTORY, "", track_ack=False,
+                            extra={"filename": filename, "text": text, "file_time": file_time},
+                            shown=f"inventory {filename} ({len(text)} bytes)")
 
     # ─── Pipe watchdog / WS lifecycle ────────
 
@@ -154,6 +174,7 @@ class App:
     def shutdown(self):
         """Stop background services and remove the tray icon."""
         self.ws.stop()
+        self.inventory.stop()
         self.pipe_reader.stop()
         if self._tray_icon:
             self._tray_icon.stop()
@@ -306,12 +327,21 @@ class App:
             row=2, column=1, sticky="w", padx=(0, 10), pady=8
         )
 
+        # Sends new <Character>-Inventory.txt files to the website's inventory page
+        ttk.Label(f, text="Upload Inventory:", anchor="e").grid(
+            row=3, column=0, sticky="e", padx=(10, 4), pady=8
+        )
+        self._var_upload_inventory = tk.BooleanVar(value=self.config.upload_inventory)
+        ttk.Checkbutton(f, variable=self._var_upload_inventory).grid(
+            row=3, column=1, sticky="w", padx=(0, 10), pady=8
+        )
+
         # Whitelist / Blacklist
         list_frame = ttk.Frame(f)
-        list_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=10, pady=4)
+        list_frame.grid(row=4, column=0, columnspan=2, sticky="nsew", padx=10, pady=4)
         list_frame.columnconfigure(0, weight=1)
         list_frame.columnconfigure(1, weight=1)
-        f.rowconfigure(3, weight=1)
+        f.rowconfigure(4, weight=1)
 
         for col, (title, attr_box, is_white) in enumerate([
             ("Whitelisted Characters", "_wl_box", True),
@@ -347,7 +377,7 @@ class App:
 
         # Advanced: settings most people never need, hidden until asked for
         adv_head = ttk.Frame(f, cursor="hand2")
-        adv_head.grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=(10, 0))
+        adv_head.grid(row=5, column=0, columnspan=2, sticky="ew", padx=10, pady=(10, 0))
         adv_head.columnconfigure(1, weight=1)
         self._lbl_advanced = ttk.Label(adv_head, foreground=self.ACC, cursor="hand2",
                                        font=("Segoe UI", 10, "bold"))
@@ -360,9 +390,9 @@ class App:
         # hits); only needed when the folder of the game behind the Zeal pipe
         # can't be found
         lbl_eq_dir = ttk.Label(f, text="EverQuest folder:", anchor="e")
-        lbl_eq_dir.grid(row=5, column=0, sticky="e", padx=(10, 4), pady=8)
+        lbl_eq_dir.grid(row=6, column=0, sticky="e", padx=(10, 4), pady=8)
         eq_row = ttk.Frame(f)
-        eq_row.grid(row=5, column=1, sticky="ew", padx=(0, 10), pady=8)
+        eq_row.grid(row=6, column=1, sticky="ew", padx=(0, 10), pady=8)
         eq_row.columnconfigure(0, weight=1)
         self._ent_eq_dir = ttk.Entry(eq_row)
         self._ent_eq_dir.insert(0, self.config.eq_dir)
@@ -374,26 +404,26 @@ class App:
 
         # Older servers, or anyone who'd rather paste a key from the setup page
         lbl_key = ttk.Label(f, text="API Key:", anchor="e")
-        lbl_key.grid(row=6, column=0, sticky="e", padx=(10, 4), pady=8)
+        lbl_key.grid(row=7, column=0, sticky="e", padx=(10, 4), pady=8)
         self._ent_apikey = ttk.Entry(f, show="●")
         self._ent_apikey.insert(0, self.config.api_key)
-        self._ent_apikey.grid(row=6, column=1, sticky="ew", padx=(0, 10), pady=8)
+        self._ent_apikey.grid(row=7, column=1, sticky="ew", padx=(0, 10), pady=8)
 
         # Packet capture checkbox (debugging aid)
         lbl_capture = ttk.Label(f, text="Capture packets:", anchor="e")
-        lbl_capture.grid(row=7, column=0, sticky="e", padx=(10, 4), pady=8)
+        lbl_capture.grid(row=8, column=0, sticky="e", padx=(10, 4), pady=8)
         self._var_capture_packets = tk.BooleanVar(value=self.config.capture_packets)
         chk_capture = ttk.Checkbutton(
             f, variable=self._var_capture_packets,
             text=f"Write every Zeal packet to {CAPTURE_FILE}",
         )
-        chk_capture.grid(row=7, column=1, sticky="w", padx=(0, 10), pady=8)
+        chk_capture.grid(row=8, column=1, sticky="w", padx=(0, 10), pady=8)
 
         # Boss fight damage for the website's damage parser
         lbl_combat = ttk.Label(f, text="Boss fight damage:", anchor="e")
-        lbl_combat.grid(row=8, column=0, sticky="ne", padx=(10, 4), pady=8)
+        lbl_combat.grid(row=9, column=0, sticky="ne", padx=(10, 4), pady=8)
         combat_row = ttk.Frame(f)
-        combat_row.grid(row=8, column=1, sticky="w", padx=(0, 10), pady=8)
+        combat_row.grid(row=9, column=1, sticky="w", padx=(0, 10), pady=8)
         self._var_send_combat = tk.BooleanVar(value=self.config.send_combat)
         ttk.Checkbutton(combat_row, variable=self._var_send_combat,
                         text="Send damage from boss fights to the server").grid(
@@ -414,7 +444,7 @@ class App:
         self._refresh_account()
 
         ttk.Button(f, text="Save Settings", command=self._save_settings).grid(
-            row=9, column=0, columnspan=2, pady=12
+            row=10, column=0, columnspan=2, pady=12
         )
 
     def _show_advanced(self, show: bool):
@@ -801,6 +831,8 @@ class App:
         if dry_run != self.config.combat_dry_run:
             self.pipe_reader.set_combat_file(COMBAT_FILE if dry_run else None)
         self.config.combat_dry_run = dry_run
+        self.config.upload_inventory = self._var_upload_inventory.get()
+        self.inventory.set_enabled(self.config.upload_inventory)
         self.config.save()
         self._log("[Config] Settings saved.")
         self._refresh_account()

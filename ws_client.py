@@ -17,6 +17,7 @@ from config import (
     MSG_TYPE_REGISTER,
     SRV_TYPE_STATS, SRV_TYPE_ACK, SRV_TYPE_AUTH_ERROR,
     SRV_TYPE_DUPLICATE_SESSION, SRV_TYPE_VERSION_NOTICE, SRV_TYPE_WATCH,
+    SRV_TYPE_INVENTORY_RESULT,
     SRV_KEY_CLIENTS, SRV_KEY_ACTIVE_SOURCE, SRV_KEY_VERSION,
 )
 
@@ -58,6 +59,8 @@ class WSClient:
         Called when the server rejects the connection permanently
         (auth error or duplicate session). The client will stop
         reconnecting and the GUI should surface this prominently.
+    on_inventory_result(data: dict)
+        Called with the server's answer to an inventory file upload.
     """
 
     def __init__(
@@ -68,12 +71,14 @@ class WSClient:
         on_server_broadcast: Callable[[dict], None],
         on_fatal:            Callable[[str], None],
         character:           str = "",
+        on_inventory_result: Optional[Callable[[dict], None]] = None,
     ):
         self.config              = config
         self.on_log              = on_log
         self.on_status           = on_status
         self.on_server_broadcast = on_server_broadcast
         self.on_fatal            = on_fatal
+        self.on_inventory_result = on_inventory_result
         self.character           = character   # updated by GUI as character changes
 
         self._loop:         Optional[asyncio.AbstractEventLoop] = None
@@ -123,12 +128,15 @@ class WSClient:
         return watched is not None and mob_key(mob) in watched
 
     def send(self, msg_type: str, message: str, is_sender: bool = False,
-             extra: Optional[dict] = None, track_ack: bool = True):
+             extra: Optional[dict] = None, track_ack: bool = True,
+             shown: Optional[str] = None) -> Optional[str]:
         """Queue an outgoing message (thread-safe). Includes character, timestamp, client_id.
         is_sender=True indicates this client's character typed the message (GUILD_TX),
         so the server can use it as the canonical version for deduplication.
         extra adds structured fields to the payload (e.g. mob/zone for kills).
         track_ack=False skips the missing-ack warning (combat batches, once a second).
+        shown replaces the payload in the log (for an inventory file's whole text).
+        Returns the msg_id, or None when there's no connection to queue it on.
         """
         if self._loop and self._loop.is_running() and self._send_queue:
             msg_id  = str(uuid.uuid4())
@@ -146,7 +154,9 @@ class WSClient:
             if track_ack:
                 with self._acks_lock:
                     self._pending_acks[msg_id] = (queued_at, f"{msg_type}: {message[:60]}")
-            self._loop.call_soon_threadsafe(self._send_queue.put_nowait, (queued_at, payload))
+            self._loop.call_soon_threadsafe(self._send_queue.put_nowait, (queued_at, payload, shown))
+            return msg_id
+        return None
 
     # ─── Event loop ───────────────────────────
 
@@ -259,6 +269,10 @@ class WSClient:
         elif msg_type == SRV_TYPE_VERSION_NOTICE:
             self.on_log(f"[WS] Version notice: {data.get('message', '')}")
 
+        elif msg_type == SRV_TYPE_INVENTORY_RESULT:
+            if self.on_inventory_result:
+                self.on_inventory_result(data)
+
         elif msg_type == SRV_TYPE_WATCH:
             self._watched = frozenset(data.get("mobs") or [])
             self.on_log(f"[WS] Reporting kills of {len(self._watched)} watched mobs")
@@ -270,18 +284,19 @@ class WSClient:
     async def _send_loop(self, ws):
         try:
             while True:
-                queued_at, payload = await self._send_queue.get()
+                queued_at, payload, shown = await self._send_queue.get()
                 if time.time() - queued_at > MESSAGE_MAX_AGE:
                     self.on_log(f"[WS] Dropping stale queued message (>{MESSAGE_MAX_AGE}s old)")
                     continue
                 try:
                     await ws.send(payload)
-                    shown = payload if len(payload) <= 500 else f"{payload[:500]}… ({len(payload)} bytes)"
+                    if shown is None:
+                        shown = payload if len(payload) <= 500 else f"{payload[:500]}… ({len(payload)} bytes)"
                     self.on_log(f"[WS] Sent: {shown}")
                 except Exception as e:
                     self.on_log(f"[WS] Send error: {e} — requeueing message")
                     # Put it back at the front so it's retried on reconnect
-                    await self._send_queue.put((queued_at, payload))
+                    await self._send_queue.put((queued_at, payload, shown))
                     raise  # propagate to trigger reconnect
         except asyncio.CancelledError:
             pass

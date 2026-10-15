@@ -18,6 +18,7 @@ CONFIG_FILE = "config.yaml"
 CAPTURE_FILE = "packet_capture.log"   # written when packet capture is enabled
 ZONE_STATE_FILE = "zone_state.json"   # each character's last zone copy, kept across logins
 COMBAT_FILE  = "combat_batches.jsonl"  # combat batches, written when the combat dry run is on
+INVENTORY_STATE_FILE = "inventory_uploads.json"   # inventory files already uploaded (inventory_watcher.py)
 
 # ─────────────────────────────────────────────
 # Zeal pipe constants
@@ -62,6 +63,7 @@ SRV_TYPE_AUTH_ERROR        = "auth_error"
 SRV_TYPE_DUPLICATE_SESSION = "duplicate_session"
 SRV_TYPE_VERSION_NOTICE    = "version_notice"
 SRV_TYPE_WATCH             = "watch"   # mob keys worth reporting kills of
+SRV_TYPE_INVENTORY_RESULT  = "inventory_result"   # the server's answer to an inventory upload
 
 # Keys inside the "stats" message
 SRV_KEY_CLIENTS       = "connected"
@@ -81,6 +83,7 @@ MSG_TYPE_WHO      = "who"
 MSG_TYPE_KILL     = "kill"   # NPC kill seen by this client, with zone + PvP context
 MSG_TYPE_ZONE     = "zone"   # this client entered a zone (server logs the copy; temporary)
 MSG_TYPE_COMBAT   = "combat" # one second of boss fight combat lines (see combat.py)
+MSG_TYPE_INVENTORY = "inventory"  # a <Character>-Inventory.txt (see inventory_watcher.py)
 
 # ─────────────────────────────────────────────
 # Yellow-text filter patterns
@@ -130,6 +133,7 @@ class Config:
         self.capture_packets: bool      = False
         self.send_combat:     bool      = True    # send boss fight damage for the website
         self.combat_dry_run:  bool      = False   # also write combat batches to COMBAT_FILE
+        self.upload_inventory: bool     = False   # send new <Character>-Inventory.txt files to the website
         self.icon_dir:        str       = "icons"
         self.icon_name:       str       = "icon.png"
         self.eq_dir:          str       = ""   # EQ folder for log fallback; "" = auto
@@ -157,6 +161,7 @@ class Config:
             self.capture_packets = bool(app.get("capture_packets", self.capture_packets))
             self.send_combat     = bool(app.get("send_combat",     self.send_combat))
             self.combat_dry_run  = bool(app.get("combat_dry_run",  self.combat_dry_run))
+            self.upload_inventory = bool(app.get("upload_inventory", self.upload_inventory))
             self.icon_dir        = app.get("icon_dir",        self.icon_dir)
             self.icon_name       = app.get("icon_name",       self.icon_name)
             self.eq_dir          = app.get("eq_dir",          self.eq_dir) or ""
@@ -180,6 +185,7 @@ class Config:
                 "capture_packets": self.capture_packets,
                 "send_combat":     self.send_combat,
                 "combat_dry_run":  self.combat_dry_run,
+                "upload_inventory": self.upload_inventory,
                 "icon_dir":        self.icon_dir,
                 "icon_name":       self.icon_name,
                 "eq_dir":          self.eq_dir,
