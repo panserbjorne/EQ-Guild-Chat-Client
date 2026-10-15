@@ -56,6 +56,20 @@ character:
   own death / "You begin casting  → the next zone-in is a trip to the bind
     Gate."                         point, which is always the Normal copy
                                  (EQMacEmu GoToBind), even in the same zone
+  own death                    → the copy you died in is remembered; a rez
+                                 sends you back into that copy (EQMacEmu
+                                 MovePCGuildID to the corpse's zone guild
+                                 id), so zoning into that zone right after a
+                                 rez restores its entry, hint and PvP flag.
+                                 A rez shows "You regain some experience from
+                                 resurrection." and/or "You are exhausted."
+                                 (Resurrection Effects) just before zoning
+                                 (every death costs experience, so even
+                                 Divine Resurrection shows the first). The
+                                 rez offer isn't used, since most players
+                                 bind within a short run of the raid zones,
+                                 nor the corpse's spot, since corpses can be
+                                 dragged.
   merchant / horse refusals    → "instance" hint: only shown inside a guild
                                  or PvP copy
   camp / log back in           → you return to the same copy, so each
@@ -130,6 +144,10 @@ _RE_SELF_DEATH  = re.compile(r"^(?:You have been slain by .+?[!.]|You died\.)$")
 _RE_GATE_CAST   = re.compile(r"^You begin casting Gate\.$")
 _RE_OTHER_CAST  = re.compile(r"^(?:You begin casting .+\.|Your spell is interrupted\.|Your spell fizzles!)$")
 GATE_WINDOW     = 30
+# Lines shown just before a rez zones you: they count if the zoning follows
+# within GATE_WINDOW. Corpses are forgotten after CORPSE_KEEP seconds.
+_RE_REZ_DONE    = re.compile(r"^(?:You regain some experience from resurrection\.|You are exhausted\.)")
+CORPSE_KEEP     = 24 * 3600
 
 # Sentinel pushed onto the queue to signal the worker to stop
 _STOP = object()
@@ -191,6 +209,9 @@ class ZoneState:
     hint:     str            = ""     # "instance" / "pvp" from in-zone refusals
     login:    bool           = True   # next zone entry is a login, not a trip
     camped:   bool           = False  # camp message seen; logging out
+    corpses:  dict           = field(default_factory=dict)  # zone (lower) → copy died in + spot
+    rez_at:   float          = 0.0    # when a rez landed (experience / Resurrection Effects)
+    rezzed:   str            = ""     # why the trip in progress is a rez ("" = it isn't)
 
 
 class ZealPipeReader(threading.Thread):
@@ -623,6 +644,9 @@ class ZealPipeReader(threading.Thread):
         if character not in self._zones:
             st = self._zones[character] = ZoneState()
             saved = self._saved_zones.get(character) or {}
+            if isinstance(saved.get("corpses"), dict):
+                st.corpses = {k: v for k, v in saved["corpses"].items()
+                              if isinstance(v, dict) and time.time() - v.get("at", 0) <= CORPSE_KEEP}
             if isinstance(saved.get("pvp_flag"), bool):
                 # The flag stays set across logins: start from the last one seen
                 st.pvp_flag, st.pvp_flag_at = saved["pvp_flag"], float(saved.get("pvp_flag_at") or 0)
@@ -721,7 +745,9 @@ class ZealPipeReader(threading.Thread):
                         if st.zone_id is not None and st.loc and not st.login else None)
         st.loc = None
         st.to_bind = st.died or time.time() - st.gate_at <= GATE_WINDOW
-        st.died, st.gate_at = False, 0.0
+        now = time.time()
+        st.rezzed = "rez landed" if not st.died and now - st.rez_at <= GATE_WINDOW else ""
+        st.died, st.gate_at, st.rez_at = False, 0.0, 0.0
 
     def _handle_zone_enter(self, character: str, zone: str):
         st = self._zone_state(character)
@@ -735,6 +761,7 @@ class ZealPipeReader(threading.Thread):
             st.zone_pvp = st.pvp_flag
         if st.to_bind and st.zone.lower() == zone.lower():
             self.on_log(f"[Zone] {character} died or gated back into {zone}: Normal copy")
+        trip = not st.login and not st.to_bind
         st.departure, st.to_bind = None, False
         st.zone     = zone
         st.zone_id  = None   # stale until the next player packet
@@ -745,6 +772,10 @@ class ZealPipeReader(threading.Thread):
             st.reload = saved.get("reload")
             self.on_log(f"[Zone] {character} logged back into the same copy of {zone}")
         st.login = st.camped = False
+        corpse = st.corpses.get(zone.lower())
+        if trip and corpse and st.rezzed:
+            self._back_to_corpse(character, st.rezzed)
+        st.rezzed = ""
         self._save_zone(character)
         pvp = {True: "PvP flag on", False: "PvP flag off", None: "PvP flag unknown"}[st.zone_pvp]
         came = (f"from {st.entry['x']:.0f}, {st.entry['y']:.0f} in zone {st.entry['zone_id']}"
@@ -761,6 +792,29 @@ class ZealPipeReader(threading.Thread):
             "reload":   st.reload,
             "instance": st.hint,
         })
+
+    def _note_death(self, character: str):
+        """Remember which copy we died in and where, since a rez returns us there."""
+        st = self._zone_state(character)
+        st.died = True
+        if not st.zone:
+            return
+        corpse = {"zone": st.zone, "entry": st.entry, "reload": st.reload,
+                  "hint": st.hint, "pvp": st.zone_pvp, "at": time.time()}
+        st.corpses[st.zone.lower()] = corpse
+        self._save_zone(character)
+
+    def _back_to_corpse(self, character: str, why: str):
+        """Rezzed: we're in the copy our corpse was in, not the bind point's."""
+        st = self._zone_state(character)
+        corpse = st.corpses.pop(st.zone.lower(), None)
+        if not corpse:
+            return
+        st.entry, st.reload = corpse.get("entry"), corpse.get("reload")
+        st.hint, st.zone_pvp = corpse.get("hint", ""), corpse.get("pvp")
+        self._save_zone(character)
+        self.on_log(f"[Zone] {character} resurrected back into {st.zone} ({why}): "
+                    "same copy as the corpse")
 
     def _load_saved_zones(self) -> dict:
         try:
@@ -781,6 +835,12 @@ class ZealPipeReader(threading.Thread):
                 "zone": st.zone, "entry": st.entry, "reload": st.reload, "hint": st.hint,
                 "pvp": st.zone_pvp,
             }
+        now = time.time()
+        st.corpses = {k: v for k, v in st.corpses.items() if now - v.get("at", 0) <= CORPSE_KEEP}
+        if st.corpses:
+            saved["corpses"] = st.corpses
+        else:
+            saved.pop("corpses", None)
         if st.pvp_flag_at:   # only a seen toggle, not the assumed default
             saved.update({"pvp_flag": st.pvp_flag, "pvp_flag_at": st.pvp_flag_at})
         self._saved_zones[character] = saved
@@ -988,7 +1048,16 @@ class ZealPipeReader(threading.Thread):
         if character and (self._send_combat or self._combat_path):
             now = getattr(self._read, "read_at", None) or time.time()
             self._pump_log(character, now)   # hits logged before this line come first
-            self._combat_tracker(character).feed(text, now=now, chat_type=zeal_type)
+            tracker = self._combat_tracker(character)
+            tracker.feed(text, now=now, chat_type=zeal_type)
+            if RE_LOADING.search(text):
+                # Zoning ends the fight: send its last lines (a death among
+                # them) now, while the batch still names the zone it was in.
+                # Lines can arrive in a burst after the load, and the zone-in
+                # read before the next tick would tag them with the new zone.
+                batch = tracker.drain()
+                if batch:
+                    self._send_combat_batch(character, batch)
 
         # Logging out (chat type not yet confirmed): the next login isn't a
         # trip from this spot
@@ -996,9 +1065,12 @@ class ZealPipeReader(threading.Thread):
             st = self._zone_state(character)
             st.loc, st.login, st.camped = None, True, True
 
-        # Dying or gating sends you to your bind point's Normal copy
+        # Dying or gating sends you to your bind point's Normal copy; a rez
+        # brings you back to the copy the corpse is in
         if _RE_SELF_DEATH.match(text):
-            self._zone_state(character).died = True
+            self._note_death(character)
+        elif _RE_REZ_DONE.match(text):
+            self._zone_state(character).rez_at = time.time()
         elif _RE_GATE_CAST.match(text):
             self._zone_state(character).gate_at = time.time()
         elif _RE_OTHER_CAST.match(text):
