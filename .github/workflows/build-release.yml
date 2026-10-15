@@ -19,12 +19,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
           python-version: '3.13.3'
 
@@ -43,12 +43,14 @@ jobs:
       - name: Create a changelog since the last release tag
         id: changelog
         shell: bash
+        env:
+          RELEASE_NOTES: ${{ github.event.inputs.release_notes }}
         run: |
           CHANGELOG="${{ github.workspace }}-changelog.txt"
           LAST_TAG=$(git describe --tags $(git rev-list --tags --max-count=1))
           echo "# Release notes" > $CHANGELOG
-          echo ${{ github.event.inputs.release_notes }} >> $CHANGELOG
-          echo ""
+          echo "$RELEASE_NOTES" >> $CHANGELOG
+          echo "" >> $CHANGELOG
           echo "# Changes since $LAST_TAG" >> $CHANGELOG
           git log --pretty=format:"- %s" $LAST_TAG..HEAD >> $CHANGELOG
           echo filename=$CHANGELOG >> $GITHUB_OUTPUT
