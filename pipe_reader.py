@@ -72,6 +72,10 @@ character:
                                  dragged.
   merchant / horse refusals    → "instance" hint: only shown inside a guild
                                  or PvP copy
+  raid / group members with a  → "near": Zeal only gives a location for
+    location                     members in your copy of the zone, so the
+                                 server has clients that see each other agree
+                                 on the copy
   camp / log back in           → you return to the same copy, so each
                                  character's zone, entry, hint and PvP flag
                                  are saved to ZONE_STATE_FILE and restored
@@ -132,6 +136,7 @@ from config import (
     RE_KILL_YOU, RE_KILL_OTHER, RE_KILL_DIED, RE_ZONE_ENTER, RE_PVP_ON, RE_PVP_OFF,
     RE_LOADING, RE_CAMPING, RE_NO_MERCHANT, RE_NO_HORSE,
     ZEAL_STAT_HP_PCT, ZEAL_STAT_MANA_PCT, ZEAL_STAT_TARGET, ZEAL_STAT_TARGET_HP, ZEAL_STAT_TARGET_PET_OWNER, ZEAL_STAT_BUFFS,
+    ZEAL_STAT_GROUP_NAMES, ZEAL_STAT_GROUP_HP,
     ZEAL_TYPE_YELLOW, ZEAL_TYPE_DEFAULT,
     ZEAL_TYPE_GUILD_RX, ZEAL_TYPE_GUILD_TX, ZEAL_TYPE_WHO, MSG_TYPE_GUILD,
     MSG_TYPE_QUAKE, MSG_TYPE_WHO, MSG_TYPE_PVP, MSG_TYPE_TIME,
@@ -252,6 +257,7 @@ class ZealPipeReader(threading.Thread):
         self._selves: dict[str, dict] = {}            # character → its own class / level
         self._raids:  dict[str, tuple] = {}           # character → (time, {name: class/level})
         self._groups: dict[str, tuple] = {}           # character → (time, {name: class/level})
+        self._near:   dict[str, dict] = {}            # character → {packet type: (time, {names in the zone})}
         self._roster_sent: dict[str, tuple] = {}      # character → (fight_start, roster) last sent
         self._combat_path: Optional[str] = None       # dry run file; None = off
         self._combat_lock = threading.Lock()
@@ -590,6 +596,7 @@ class ZealPipeReader(threading.Thread):
                 buffs = None   # stays None when the packet carries no buff labels
                 casting = None
                 hp, mana = None, None
+                group_names, group_hp = {}, {}   # group window slot → name, HP percent
                 for item in items:
                     t = item.get("type")
                     v = item.get("value", "")
@@ -619,6 +626,10 @@ class ZealPipeReader(threading.Thread):
                                 buffs.add(str(v).strip())
                         elif t == ZEAL_STAT_CASTING:
                             casting = str(v).strip()
+                        elif t in ZEAL_STAT_GROUP_NAMES:
+                            group_names[t - ZEAL_STAT_GROUP_NAMES[0]] = str(v).strip()
+                        elif t in ZEAL_STAT_GROUP_HP:
+                            group_hp[t - ZEAL_STAT_GROUP_HP[0]] = int(v)
                     except (ValueError, TypeError):
                         pass
                 if character:
@@ -638,6 +649,12 @@ class ZealPipeReader(threading.Thread):
                     if hp is not None:
                         self._combat_tracker(character).vitals(
                             hp, mana, now=getattr(self._read, "read_at", None))
+                        # Other players' HP we can see: the group window, and our target
+                        seen = {n: group_hp[i] for i, n in group_names.items() if n and i in group_hp}
+                        if target and target_hp is not None:
+                            seen.setdefault(target, target_hp)
+                        self._combat_tracker(character).others_hp(
+                            seen, now=getattr(self._read, "read_at", None))
                     if me:
                         self._selves[character] = me
         except Exception:
@@ -749,6 +766,7 @@ class ZealPipeReader(threading.Thread):
         st.departure = ({"zone_id": st.zone_id, "x": st.loc[0], "y": st.loc[1]}
                         if st.zone_id is not None and st.loc and not st.login else None)
         st.loc = None
+        self._near.pop(character, None)   # those locations were the zone we're leaving
         st.to_bind = st.died or time.time() - st.gate_at <= GATE_WINDOW
         now = time.time()
         st.rezzed = "rez landed" if not st.died and now - st.rez_at <= GATE_WINDOW else ""
@@ -796,6 +814,7 @@ class ZealPipeReader(threading.Thread):
             "entry":    st.entry,
             "reload":   st.reload,
             "instance": st.hint,
+            "near":     self._near_names(character),
         })
 
     def _note_death(self, character: str):
@@ -892,6 +911,7 @@ class ZealPipeReader(threading.Thread):
             "entry":   st.entry,
             "reload":  st.reload,
             "instance": st.hint,
+            "near":    self._near_names(character),
         })
 
     def _handle_members(self, character: str, outer_type: int, data_raw):
@@ -900,7 +920,7 @@ class ZealPipeReader(threading.Thread):
             data = json.loads(data_raw) if isinstance(data_raw, str) else data_raw
             if not isinstance(data, list):
                 return
-            members = {}
+            members, near = {}, set()
             tracker = self._combat_tracker(character)
             now = getattr(self._read, "read_at", None)
             for m in data:
@@ -909,13 +929,29 @@ class ZealPipeReader(threading.Thread):
                     members[name] = {k: m[k] for k in ("class", "level") if k in m}
                     loc = m.get("loc") or {}
                     if "x" in loc and "y" in loc:
+                        if name != character:
+                            near.add(name)
                         # Where they are, for the fight's map (only members in the zone have one)
                         tracker.other_location(name, float(loc["x"]), float(loc["y"]),
                                                float(loc["z"]) if "z" in loc else None, now=now)
             store = self._raids if outer_type == ZEAL_PACKET_RAID else self._groups
             store[character] = (time.time(), members)
+            self._near.setdefault(character, {})[outer_type] = (time.time(), near)
         except Exception:
             pass
+
+    def _near_names(self, character: str) -> list:
+        """
+        Raid / group members Zeal gives a location for: they're in this
+        character's copy of the zone. The server has clients that see each
+        other agree on the copy (Normal / PvP / Guild).
+        """
+        now = time.time()
+        names = set()
+        for at, near in list(self._near.get(character, {}).values()):
+            if now - at <= 10:
+                names |= near
+        return sorted(names)
 
     def _roster(self, character: str) -> dict:
         """
@@ -1021,6 +1057,7 @@ class ZealPipeReader(threading.Thread):
             "entry":    st.entry,
             "reload":   st.reload,
             "instance": st.hint,
+            "near":     self._near_names(character),
         })
         roster = self._roster(character)
         if self._roster_sent.get(character) != (batch["fight_start"], roster):

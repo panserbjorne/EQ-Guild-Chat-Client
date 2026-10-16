@@ -22,6 +22,9 @@ Kinds of line kept
   sourceless "X was hit by non-melee for 500 points of damage."  (our own nuke or
             damage shield, or someone else's; see self_spell below)
   dot       "X has taken 93 damage from your Denon`s Bereavement."  (ours only)
+  taken     "Your system is assaulted by a deadly virus. (Rot of the Plaguebringer)  You
+            have taken 512 points of damage."  (a spell hitting us; only we see it,
+            and it names no caster)
   crit      "Bob scores a critical hit! (48)"  (never added to totals server side)
   land      "X reels in terrible pain. (Saryrn's Scream of Pain)" or "X was pierced
             by thorns." — only right after a sourceless line on the same target,
@@ -53,6 +56,8 @@ Each batch also carries boss_hp, the watched mobs' HP percent from Zeal's
 target labels whenever it changed: [[ts, name, percent], ...], and buffs, our
 own buffs from Zeal's buff labels whenever they changed: [[ts, [spell, ...]], ...],
 vitals, our own HP and mana percent whenever they changed: [[ts, hp, mana], ...],
+other_hp, other players' HP percent from our group window and target labels
+whenever it changed, and null when we stopped seeing it: [[ts, name, percent], ...],
 locs, where we were from Zeal's player packets whenever we moved LOC_STEP or
 more: [[ts, x, y, z], ...], and others' positions the same way: other_locs
 [[ts, name, x, y, z], ...] for raid / group members (Zeal's raid and group
@@ -103,6 +108,7 @@ RE_HIT        = re.compile(rf"^(?P<src>.+?) {_VERBS} (?P<tgt>.+?) for (?P<dmg>\d
                            r"points? of damage\.$")
 RE_NONMELEE   = re.compile(r"^(?P<src>.+?) hit (?P<tgt>.+?) for (?P<dmg>\d+) points? of non-melee damage\.$")
 RE_SOURCELESS = re.compile(r"^(?P<tgt>.+?) was hit by non-melee for (?P<dmg>\d+) points? of damage\.$")
+RE_SPELL_TAKEN = re.compile(r"You have taken \d+ points? of damage\.$")
 RE_DOT        = re.compile(r"^(?P<tgt>.+?) has taken (?P<dmg>\d+) (?:points of )?damage from your (?P<spell>.+?)\.$")
 RE_MISS       = re.compile(r"^(?P<src>.+?) tr(?:y|ies) to \w+ (?P<tgt>.+?), but (?P<how>.+)$")
 RE_MISSED     = re.compile(r"^(?P<src>.+?) missed (?P<tgt>[^,.!']+)$")   # the short form: "Gaukr Sandstorm missed Venexia"
@@ -175,6 +181,8 @@ class CombatTracker:
         self._sourceless: dict = {}        # target (lower) → time of last sourceless line
         self._hp_last: dict = {}           # watched mob → (when, HP percent) from the target labels
         self._hp_out: list = []            # [ts, name, percent] waiting for the next batch
+        self._seen_hp: dict = {}           # other player → HP percent we can see now (group window, target)
+        self._seen_hp_out: list = []       # [ts, name, percent or None] waiting for the next batch
         self._buffs: tuple = ()            # our buffs now, from Zeal's buff labels
         self._buffs_out: list = []         # [ts, [spell, ...]] waiting for the next batch
         self._vitals: Optional[tuple] = None   # (when, hp, mana): ours now
@@ -283,6 +291,22 @@ class CombatTracker:
             if self.active:
                 self._hp_out.append([round(now, 2), name, percent])
 
+    def others_hp(self, seen: dict, now: Optional[float] = None):
+        """
+        Other players' HP percent we can see right now, from Zeal's group
+        member and target labels: {name: percent}. Kept when one changes
+        during a fight, with None when we stop seeing someone, so the
+        server knows when nobody was watching their HP.
+        """
+        now = round(now or time.time(), 2)
+        seen = {RE_SPAWN_ID.sub("", n.strip()): p for n, p in seen.items()}
+        seen = {n: p for n, p in seen.items() if RE_OWNER_NAME.match(n) and n != self.character}
+        with self._lock:
+            if self.active:
+                self._seen_hp_out += [[now, n, p] for n, p in seen.items() if self._seen_hp.get(n) != p]
+                self._seen_hp_out += [[now, n, None] for n in self._seen_hp if n not in seen]
+            self._seen_hp = seen
+
     def buffs(self, spells, now: Optional[float] = None):
         """Zeal's buff labels: our buffs right now, kept when they change during a fight."""
         spells = tuple(sorted(spells))
@@ -378,6 +402,8 @@ class CombatTracker:
         elif m := RE_NONMELEE.match(text):
             extra = {"type": chat_type} if chat_type is not None else {}
             self._keep(now, "nonmelee", text, m.group("src"), m.group("tgt"), **extra)
+        elif RE_SPELL_TAKEN.search(text):
+            self._keep(now, "taken", text, "", "")
         elif m := RE_HIT.match(text):
             self._keep(now, "hit", text, m.group("src"), m.group("tgt"))
         elif m := RE_DOT.match(text):
@@ -494,6 +520,7 @@ class CombatTracker:
                         if now - at <= PREROLL_SECONDS]
         self._buffs_out = [[round(now, 2), list(self._buffs)]] if self._buffs else []
         self._vitals_out = [[round(now, 2), *self._vitals[1:]]] if self._vitals else []
+        self._seen_hp_out = [[round(now, 2), n, p] for n, p in self._seen_hp.items()]
         self._locs_out = [[round(now, 2), *self._loc[1:]]] if self._loc else []
         self._others = {}
         self._others_out = []
@@ -521,7 +548,7 @@ class CombatTracker:
             self._flush_casts(now)
             if not self._out and not self._misses and not self._ended and not self._hp_out \
                     and not self._buffs_out and not self._vitals_out and not self._locs_out \
-                    and not self._others_out:
+                    and not self._others_out and not self._seen_hp_out:
                 return None
             batch = {
                 "lines":   self._out,
@@ -543,6 +570,9 @@ class CombatTracker:
             if self._vitals_out:
                 batch["vitals"] = self._vitals_out
                 self._vitals_out = []
+            if self._seen_hp_out:
+                batch["other_hp"] = self._seen_hp_out
+                self._seen_hp_out = []
             if self._locs_out:
                 batch["locs"] = self._locs_out
                 self._locs_out = []
