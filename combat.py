@@ -63,6 +63,10 @@ more: [[ts, x, y, z], ...], and others' positions the same way: other_locs
 [[ts, name, x, y, z], ...] for raid / group members (Zeal's raid and group
 packets) and watched mobs we target (the player packet's target_loc, only
 sent while it's close). Zeal's x and y are the game's y and x, as in /loc.
+targets has the level, class and spawn id of each watched mob we target,
+from the player packet: [[ts, name, level, class, spawn id], ...], so the
+server can tell a boss from a look-alike with the same name (a fake Shei
+Vinitras is level 65, the real one level 63).
 
 Melee hits shortened by the game's hit display options ("slash a gnoll for
 123", or just "123") can't be read, so once one shows up the reader switches
@@ -191,6 +195,8 @@ class CombatTracker:
         self._locs_out: list = []          # [ts, x, y, z] waiting for the next batch
         self._others: dict = {}            # name → (x, y): where a raid member or boss was last sent from
         self._others_out: list = []        # [ts, name, x, y, z] waiting for the next batch
+        self._target_last: dict = {}       # watched mob → (when, level, class, spawn id) we last targeted
+        self._targets_out: list = []       # [ts, name, level, class, spawn id] waiting for the next batch
         self.abbreviated = 0               # abbreviated hit lines seen (see RE_ABBREVIATED)
         self.hits_from_log = False         # melee hits come from feed_log(), not the pipe
 
@@ -356,6 +362,24 @@ class CombatTracker:
             self._others[name] = (x, y)
             self._others_out.append([round(now or time.time(), 2), name, round(x, 1), round(y, 1),
                                      None if z is None else round(z, 1)])
+
+    def target_info(self, name: str, level: int, cls: int, spawn_id: Optional[int],
+                    now: Optional[float] = None):
+        """
+        The level, class and spawn id of a watched mob we have targeted, from
+        Zeal's player packet: kept whenever it's a different spawn.
+        """
+        name = RE_SPAWN_ID.sub("", (name or "").strip())
+        if not name or not self.is_watched(name):
+            return
+        now = now or time.time()
+        with self._lock:
+            last = self._target_last.get(name)
+            self._target_last[name] = (now, level, cls, spawn_id)
+            if last and last[1:] == (level, cls, spawn_id):
+                return
+            if self.active:
+                self._targets_out.append([round(now, 2), name, level, cls, spawn_id])
 
     def _from_boss(self, text: str) -> bool:
         """Whether a line starts with the name of a watched mob in the current fight."""
@@ -524,6 +548,8 @@ class CombatTracker:
         self._locs_out = [[round(now, 2), *self._loc[1:]]] if self._loc else []
         self._others = {}
         self._others_out = []
+        self._targets_out = [[round(at, 2), name, *rest] for name, (at, *rest) in self._target_last.items()
+                             if now - at <= PREROLL_SECONDS]
         self._buffer.clear()
         self._buf_misses.clear()
 
@@ -548,7 +574,7 @@ class CombatTracker:
             self._flush_casts(now)
             if not self._out and not self._misses and not self._ended and not self._hp_out \
                     and not self._buffs_out and not self._vitals_out and not self._locs_out \
-                    and not self._others_out and not self._seen_hp_out:
+                    and not self._others_out and not self._seen_hp_out and not self._targets_out:
                 return None
             batch = {
                 "lines":   self._out,
@@ -579,6 +605,9 @@ class CombatTracker:
             if self._others_out:
                 batch["other_locs"] = self._others_out
                 self._others_out = []
+            if self._targets_out:
+                batch["targets"] = self._targets_out
+                self._targets_out = []
             self._out    = []
             self._misses = collections.Counter()
             self._hp_out = []

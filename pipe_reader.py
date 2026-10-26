@@ -96,6 +96,9 @@ location (and its raid's, and a targeted boss's) when they change, and optionall
 COMBAT_FILE as one JSON object per line (the dry run). The first batch of a
 fight, and any batch after the roster changes, also carries the classes and
 levels of the character, its group and its raid (raid / group packets).
+Kill reports and batches also say the level and class of the NPC we last
+targeted by that name (Zeal's target descriptors), so the server can tell
+a boss from a same-named fake.
 
 When a character's melee hits come through shortened (the game's hit
 display options set to Abbreviated or Number Only), its EQ log is followed
@@ -153,6 +156,9 @@ GATE_WINDOW     = 30
 # within GATE_WINDOW. Corpses are forgotten after CORPSE_KEEP seconds.
 _RE_REZ_DONE    = re.compile(r"^(?:You regain some experience from resurrection\.|You are exhausted\.)")
 CORPSE_KEEP     = 24 * 3600
+# A kill carries what we last saw of that mob as our target, if this recent
+KILL_TARGET_SECONDS = 15 * 60
+TARGETS_KEPT    = 50     # NPC names remembered per character for that
 
 # Sentinel pushed onto the queue to signal the worker to stop
 _STOP = object()
@@ -254,6 +260,7 @@ class ZealPipeReader(threading.Thread):
         self._send_combat    = send_combat
         self._combat: dict[str, CombatTracker] = {}  # character → combat tracker
         self._pets:   dict[str, str] = {}             # character → pet name
+        self._npc_targets: dict[str, dict] = {}       # character → {NPC name (lower): what we last saw of it as our target}
         self._selves: dict[str, dict] = {}            # character → its own class / level
         self._raids:  dict[str, tuple] = {}           # character → (time, {name: class/level})
         self._groups: dict[str, tuple] = {}           # character → (time, {name: class/level})
@@ -750,11 +757,37 @@ class ZealPipeReader(threading.Thread):
                         str(data["target_name"]), float(tloc["x"]), float(tloc["y"]),
                         float(tloc["z"]) if "z" in tloc else None,
                         now=getattr(self._read, "read_at", None), boss=True)
+                self._note_target(character, data)
                 # Moving around means we're in game (client started mid-session)
                 if not st.camped:
                     st.login = False
         except Exception:
             pass
+
+    def _note_target(self, character: str, data: dict):
+        """
+        Our target's level and class (Zeal sends them since its target
+        descriptors), kept per NPC name so a kill or fight can say which of
+        two same-named NPCs it was.
+        """
+        name = str(data.get("target_name") or "").strip()
+        if data.get("target_type") != 1 or not name or not isinstance(data.get("target_level"), int):
+            return
+        level, cls, spawn_id = data["target_level"], data.get("target_class"), data.get("target_id")
+        now = getattr(self._read, "read_at", None) or time.time()
+        seen = self._npc_targets.setdefault(character, {})
+        seen[name.lower()] = {"level": level, "class": cls, "id": spawn_id, "at": round(now, 2)}
+        if len(seen) > TARGETS_KEPT:
+            seen.pop(min(seen, key=lambda n: seen[n]["at"]))
+        self._combat_tracker(character).target_info(name, level, cls, spawn_id, now=now)
+
+    def _kill_target(self, character: str, mob: str) -> Optional[dict]:
+        """
+        What we last saw of the mob that died as our target, if recent. It's
+        forgotten, since the next one up with that name may be another NPC.
+        """
+        seen = self._npc_targets.get(character, {}).pop(mob.strip().lower(), None)
+        return seen if seen and time.time() - seen["at"] <= KILL_TARGET_SECONDS else None
 
     def _handle_zoning(self, character: str):
         """
@@ -912,6 +945,7 @@ class ZealPipeReader(threading.Thread):
             "reload":  st.reload,
             "instance": st.hint,
             "near":    self._near_names(character),
+            "target":  self._kill_target(character, mob),
         })
 
     def _handle_members(self, character: str, outer_type: int, data_raw):
