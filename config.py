@@ -86,6 +86,7 @@ MSG_TYPE_KILL     = "kill"   # NPC kill seen by this client, with zone + PvP con
 MSG_TYPE_ZONE     = "zone"   # this client entered a zone (server logs the copy; temporary)
 MSG_TYPE_COMBAT   = "combat" # one second of boss fight combat lines (see combat.py)
 MSG_TYPE_INVENTORY = "inventory"  # a <Character>-Inventory.txt (see inventory_watcher.py)
+MSG_TYPE_RAID     = "raid"   # raid leader and members, for the raid lead voice channel status
 
 # ─────────────────────────────────────────────
 # Yellow-text filter patterns

@@ -96,6 +96,15 @@ location (and its raid's, and a targeted boss's) when they change, and optionall
 COMBAT_FILE as one JSON object per line (the dry run). The first batch of a
 fight, and any batch after the roster changes, also carries the classes and
 levels of the character, its group and its raid (raid / group packets).
+
+Raid leader
+-----------
+Zeal's raid packets mark the raid leader (rank "Raid Leader"). Each
+character's raid leader and members go out as MSG_TYPE_RAID when they change,
+and again every RAID_REPEAT seconds while in the raid, so a restarted server
+picks them up. Once raid packets stop for RAID_GONE seconds (left the raid,
+camped, game closed) an empty one says so. The server shows the leader as
+the raid's voice channel status.
 Kill reports and batches also say the level and class of the NPC we last
 targeted by that name (Zeal's target descriptors), so the server can tell
 a boss from a same-named fake.
@@ -135,7 +144,7 @@ from config import (
     ZEAL_STAT_NAME, ZEAL_STAT_LEVEL, ZEAL_STAT_CLASS,
     ZEAL_PACKET_CHAT, ZEAL_PACKET_STATS, ZEAL_PACKET_PLAYER,
     ZEAL_PACKET_RAID, ZEAL_PACKET_GROUP,
-    ZEAL_TYPE_SYSTEM, ZEAL_TYPE_DEATH, MSG_TYPE_KILL, MSG_TYPE_ZONE,
+    ZEAL_TYPE_SYSTEM, ZEAL_TYPE_DEATH, MSG_TYPE_KILL, MSG_TYPE_ZONE, MSG_TYPE_RAID,
     RE_KILL_YOU, RE_KILL_OTHER, RE_KILL_DIED, RE_ZONE_ENTER, RE_PVP_ON, RE_PVP_OFF,
     RE_LOADING, RE_CAMPING, RE_NO_MERCHANT, RE_NO_HORSE,
     ZEAL_STAT_HP_PCT, ZEAL_STAT_MANA_PCT, ZEAL_STAT_TARGET, ZEAL_STAT_TARGET_HP, ZEAL_STAT_TARGET_PET_OWNER, ZEAL_STAT_BUFFS,
@@ -159,6 +168,8 @@ CORPSE_KEEP     = 24 * 3600
 # A kill carries what we last saw of that mob as our target, if this recent
 KILL_TARGET_SECONDS = 15 * 60
 TARGETS_KEPT    = 50     # NPC names remembered per character for that
+RAID_REPEAT     = 60     # seconds between repeats of an unchanged raid leader and members
+RAID_GONE       = 10     # seconds without a raid packet before the character has left the raid
 
 # Sentinel pushed onto the queue to signal the worker to stop
 _STOP = object()
@@ -266,6 +277,7 @@ class ZealPipeReader(threading.Thread):
         self._groups: dict[str, tuple] = {}           # character → (time, {name: class/level})
         self._near:   dict[str, dict] = {}            # character → {packet type: (time, {names in the zone})}
         self._roster_sent: dict[str, tuple] = {}      # character → (fight_start, roster) last sent
+        self._raid_sent:   dict[str, tuple] = {}      # character → (time, leader, members) last sent
         self._combat_path: Optional[str] = None       # dry run file; None = off
         self._combat_lock = threading.Lock()
         self._stop_event  = threading.Event()
@@ -954,13 +966,15 @@ class ZealPipeReader(threading.Thread):
             data = json.loads(data_raw) if isinstance(data_raw, str) else data_raw
             if not isinstance(data, list):
                 return
-            members, near = {}, set()
+            members, near, leader = {}, set(), ""
             tracker = self._combat_tracker(character)
             now = getattr(self._read, "read_at", None)
             for m in data:
                 name = m.get("name") if isinstance(m, dict) else None
                 if name:
                     members[name] = {k: m[k] for k in ("class", "level") if k in m}
+                    if m.get("rank") == "Raid Leader":
+                        leader = name
                     loc = m.get("loc") or {}
                     if "x" in loc and "y" in loc:
                         if name != character:
@@ -971,8 +985,30 @@ class ZealPipeReader(threading.Thread):
             store = self._raids if outer_type == ZEAL_PACKET_RAID else self._groups
             store[character] = (time.time(), members)
             self._near.setdefault(character, {})[outer_type] = (time.time(), near)
+            if outer_type == ZEAL_PACKET_RAID:
+                self._report_raid(character, leader, sorted(members))
         except Exception:
             pass
+
+    def _report_raid(self, character: str, leader: str, names: list):
+        """Send the raid leader and members when they change, and every RAID_REPEAT seconds."""
+        now = time.time()
+        last = self._raid_sent.get(character)
+        if last and last[1:] == (leader, names) and now - last[0] < RAID_REPEAT:
+            return
+        self._raid_sent[character] = (now, leader, names)
+        text = f"raid leader {leader or '(none)'}, {len(names)} members"
+        self.on_message(character, MSG_TYPE_RAID, text, False,
+                        {"raid_character": character, "leader": leader, "members": names})
+
+    def _check_raids(self):
+        """A character whose raid packets stopped has left the raid (or camped)."""
+        now = time.time()
+        for character in list(self._raid_sent):
+            if now - self._raids.get(character, (0,))[0] > RAID_GONE:
+                del self._raid_sent[character]
+                self.on_message(character, MSG_TYPE_RAID, "left the raid", False,
+                                {"raid_character": character, "leader": "", "members": []})
 
     def _near_names(self, character: str) -> list:
         """
@@ -1072,6 +1108,10 @@ class ZealPipeReader(threading.Thread):
         """Once a second, send each character's new combat lines as one batch."""
         while not self._stop_event.is_set():
             time.sleep(1)
+            try:
+                self._check_raids()
+            except Exception as e:
+                self.on_log(f"[Raid] Check failed: {e}")
             for character, tracker in list(self._combat.items()):
                 try:
                     self._pump_log(character, time.time())
